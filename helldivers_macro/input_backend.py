@@ -15,6 +15,8 @@ INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 MAPVK_VK_TO_VSC = 0
@@ -106,7 +108,7 @@ def validate_ctypes_layouts() -> None:
 
 
 class SendInputBackend:
-    """Owns only generated MB1/R downs and releases only those owned inputs."""
+    """Owns generated MB1/MB2/R downs and releases only owned inputs."""
 
     def __init__(self, *, user32: object | None = None) -> None:
         validate_ctypes_layouts()
@@ -128,6 +130,7 @@ class SendInputBackend:
             raise InputApiError("MapVirtualKeyW could not map reload key R")
         self._lock = threading.RLock()
         self._mouse_owned = False
+        self._aim_owned = False
         self._reload_owned = False
 
     @property
@@ -143,6 +146,11 @@ class SendInputBackend:
     def reload_owned(self) -> bool:
         with self._lock:
             return self._reload_owned
+
+    @property
+    def aim_owned(self) -> bool:
+        with self._lock:
+            return self._aim_owned
 
     def _send_exactly_one(self, input_value: INPUT, description: str) -> None:
         ctypes.set_last_error(0)
@@ -181,6 +189,24 @@ class SendInputBackend:
             self._send_exactly_one(self._mouse_input(MOUSEEVENTF_LEFTUP), "MB1 up")
             self._mouse_owned = False
 
+    def aim_down(self) -> None:
+        with self._lock:
+            if self._aim_owned:
+                raise InputApiError("refusing duplicate generated MB2 down")
+            self._send_exactly_one(
+                self._mouse_input(MOUSEEVENTF_RIGHTDOWN), "MB2 down"
+            )
+            self._aim_owned = True
+
+    def aim_up(self) -> None:
+        with self._lock:
+            if not self._aim_owned:
+                return
+            self._send_exactly_one(
+                self._mouse_input(MOUSEEVENTF_RIGHTUP), "MB2 up"
+            )
+            self._aim_owned = False
+
     def reload_down(self) -> None:
         with self._lock:
             if self._reload_owned:
@@ -201,6 +227,11 @@ class SendInputBackend:
             if self._mouse_owned:
                 try:
                     self.mouse_up()
+                except InputApiError as exc:
+                    errors.append(str(exc))
+            if self._aim_owned:
+                try:
+                    self.aim_up()
                 except InputApiError as exc:
                     errors.append(str(exc))
             if self._reload_owned:

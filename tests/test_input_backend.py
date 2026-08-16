@@ -10,6 +10,8 @@ from helldivers_macro.input_backend import (
     KEYEVENTF_SCANCODE,
     MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP,
     InputApiError,
     SendInputBackend,
     validate_ctypes_layouts,
@@ -70,6 +72,20 @@ class InputBackendTests(unittest.TestCase):
         self.assertTrue(all(item.ki.dwExtraInfo == INPUT_MARKER for item in user.inputs))
         self.assertFalse(backend.reload_owned)
 
+    def test_aim_events_are_marked_owned_and_balanced(self) -> None:
+        user = FakeUser32()
+        backend = SendInputBackend(user32=user)
+        backend.aim_down()
+        backend.aim_up()
+        self.assertEqual(
+            [item.mi.dwFlags for item in user.inputs],
+            [MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP],
+        )
+        self.assertTrue(
+            all(item.mi.dwExtraInfo == INPUT_MARKER for item in user.inputs)
+        )
+        self.assertFalse(backend.aim_owned)
+
     def test_failed_up_retains_ownership_and_cleanup_retries(self) -> None:
         user = FakeUser32([1, 0, 1])
         backend = SendInputBackend(user32=user)
@@ -84,15 +100,17 @@ class InputBackendTests(unittest.TestCase):
             [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_LEFTUP],
         )
 
-    def test_release_all_attempts_both_owned_inputs(self) -> None:
+    def test_release_all_attempts_all_owned_inputs(self) -> None:
         user = FakeUser32()
         backend = SendInputBackend(user32=user)
         backend.mouse_down()
+        backend.aim_down()
         backend.reload_down()
         backend.release_all()
         self.assertFalse(backend.mouse_owned)
+        self.assertFalse(backend.aim_owned)
         self.assertFalse(backend.reload_owned)
-        self.assertEqual(len(user.inputs), 4)
+        self.assertEqual(len(user.inputs), 6)
 
     def test_duplicate_down_is_refused_without_extra_input(self) -> None:
         user = FakeUser32()

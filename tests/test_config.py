@@ -27,15 +27,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.target.executable, "helldivers2.exe")
         self.assertEqual(config.primary.shots_per_cycle, 45)
         self.assertEqual(config.primary.fire_press_ms, 35)
-        self.assertEqual(config.primary.shot_period_ms, 120)
+        self.assertEqual(config.primary.shot_period_ms, 85)
         self.assertEqual(config.primary.reload_press_ms, 25)
-        self.assertEqual(config.primary.reload_wait_ms, 2600)
+        self.assertEqual(config.primary.reload_wait_ms, 2000)
         self.assertEqual(config.secondary.shots_per_cycle, 13)
         self.assertEqual(config.secondary.fire_press_ms, 35)
-        self.assertEqual(config.secondary.shot_period_ms, 180)
+        self.assertEqual(config.secondary.shot_period_ms, 120)
         self.assertEqual(config.secondary.reload_press_ms, 25)
         self.assertEqual(config.secondary.reload_wait_ms, 2000)
         self.assertEqual(config.controls.deferred_bypass_click_ms, 20)
+        self.assertFalse(config.controls.shift_cancels_aim_natively)
         self.assertTrue(config.weapons.reload_on_select)
         self.assertEqual(config.weapons.switch_settle_ms, 500)
         self.assertEqual(config.behavior.start_policy, "immediate")
@@ -68,13 +69,13 @@ class ConfigTests(unittest.TestCase):
 
     def test_secondary_press_cannot_exceed_period(self) -> None:
         raw = raw_config()
-        raw["secondary"]["fire_press_ms"] = 181
+        raw["secondary"]["fire_press_ms"] = 121
         with self.assertRaisesRegex(ConfigError, "must not exceed"):
             parse_config(raw)
 
     def test_primary_press_cannot_exceed_period(self) -> None:
         raw = raw_config()
-        raw["primary"]["fire_press_ms"] = 121
+        raw["primary"]["fire_press_ms"] = 86
         with self.assertRaisesRegex(ConfigError, "must not exceed"):
             parse_config(raw)
 
@@ -96,6 +97,14 @@ class ConfigTests(unittest.TestCase):
         raw = raw_config()
         raw["controls"]["deferred_bypass_click_ms"] = 0
         with self.assertRaisesRegex(ConfigError, "must be positive"):
+            parse_config(raw)
+
+    def test_shift_cancels_aim_natively_must_be_boolean(self) -> None:
+        raw = raw_config()
+        raw["controls"]["shift_cancels_aim_natively"] = "false"
+        with self.assertRaisesRegex(
+            ConfigError, "controls.shift_cancels_aim_natively must be a boolean"
+        ):
             parse_config(raw)
 
     def test_switch_settle_must_be_nonnegative(self) -> None:
@@ -141,8 +150,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_primary_and_secondary_dry_run_durations(self) -> None:
         for mode, duration in (
-            ("--dry-run-primary-cycle", 8025),
-            ("--dry-run-secondary-cycle", 4365),
+            ("--dry-run-primary-cycle", 5800),
+            ("--dry-run-secondary-cycle", 3500),
         ):
             with self.subTest(mode=mode), redirect_stdout(StringIO()) as output:
                 self.assertEqual(

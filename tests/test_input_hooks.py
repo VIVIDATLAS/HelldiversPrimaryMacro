@@ -11,6 +11,7 @@ from helldivers_macro.input_hooks import (
     VK_2,
     VK_LCONTROL,
     VK_LSHIFT,
+    VK_RSHIFT,
     VK_NUMPAD1,
     VK_NUMPAD2,
     WM_KEYDOWN,
@@ -189,11 +190,15 @@ class HookPolicyTests(unittest.TestCase):
         policy.keyboard(WM_KEYUP, VK_LCONTROL, 0)
         self.assertTrue(policy.mouse(WM_LBUTTONUP, 0, 0))
 
-    def test_generated_and_injected_mb1_pass_without_control(self) -> None:
+    def test_generated_and_injected_mouse_events_pass_without_control(self) -> None:
         policy = self.make_policy()
         for flags, marker in ((LLMHF_INJECTED, 0), (0, INPUT_MARKER)):
-            self.assertFalse(policy.mouse(WM_LBUTTONDOWN, flags, marker))
-            self.assertFalse(policy.mouse(WM_LBUTTONUP, flags, marker))
+            for down, up in (
+                (WM_LBUTTONDOWN, WM_LBUTTONUP),
+                (WM_RBUTTONDOWN, WM_RBUTTONUP),
+            ):
+                self.assertFalse(policy.mouse(down, flags, marker))
+                self.assertFalse(policy.mouse(up, flags, marker))
         self.assertEqual(self.events, [])
 
     def test_outside_target_mb1_always_passes(self) -> None:
@@ -218,14 +223,51 @@ class HookPolicyTests(unittest.TestCase):
             ],
         )
 
-    def test_right_click_and_shift_are_inert_and_pass(self) -> None:
+    def test_right_click_and_shift_edges_pass_and_normalize(self) -> None:
         policy = self.make_policy()
         self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
         self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
         self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
         self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
         self.assertFalse(policy.keyboard(WM_KEYUP, VK_LSHIFT, 0))
-        self.assertEqual(self.kinds(), [])
+        self.assertEqual(
+            self.kinds(),
+            [
+                ControlEventKind.PHYSICAL_MB2_DOWN,
+                ControlEventKind.PHYSICAL_MB2_UP,
+                ControlEventKind.SHIFT_DOWN,
+                ControlEventKind.SHIFT_UP,
+            ],
+        )
+
+    def test_right_button_repeat_emits_one_physical_down_edge(self) -> None:
+        policy = self.make_policy()
+        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
+        self.assertEqual(
+            self.kinds(),
+            [
+                ControlEventKind.PHYSICAL_MB2_DOWN,
+                ControlEventKind.PHYSICAL_MB2_UP,
+            ],
+        )
+
+    def test_left_and_right_shift_autorepeat_emit_one_actionable_edge_each(self) -> None:
+        policy = self.make_policy()
+        for vk_code in (VK_LSHIFT, VK_RSHIFT):
+            self.assertFalse(policy.keyboard(WM_KEYDOWN, vk_code, 0))
+            self.assertFalse(policy.keyboard(WM_KEYDOWN, vk_code, 0))
+            self.assertFalse(policy.keyboard(WM_KEYUP, vk_code, 0))
+        self.assertEqual(
+            self.kinds(),
+            [
+                ControlEventKind.SHIFT_DOWN,
+                ControlEventKind.SHIFT_UP,
+                ControlEventKind.SHIFT_DOWN,
+                ControlEventKind.SHIFT_UP,
+            ],
+        )
 
     def test_diagnostics_ignore_unrelated_input(self) -> None:
         self.status = (True, True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 from pathlib import Path
 import unittest
 
@@ -9,6 +10,7 @@ from helldivers_macro.input_hooks import (
     VK_2,
     VK_LCONTROL,
     VK_LSHIFT,
+    VK_RSHIFT,
     WM_KEYDOWN,
     WM_KEYUP,
     WM_LBUTTONDOWN,
@@ -17,6 +19,7 @@ from helldivers_macro.input_hooks import (
     WM_RBUTTONUP,
 )
 from helldivers_macro.models import (
+    AimState,
     ControlEventKind,
     EventSource,
     MagazineState,
@@ -37,6 +40,7 @@ CONFIG = load_config(ROOT / "config.toml")
 class StateMachineTests(unittest.TestCase):
     def test_both_weapons_start_unknown(self) -> None:
         h = SimulationHarness(CONFIG, trace=False)
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
         for mode in WeaponMode:
             self.assertIs(h.machine.magazine_state(mode), MagazineState.UNKNOWN)
             self.assertIs(
@@ -312,29 +316,422 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(h.machine.generation, generation)
         self.assertFalse(any("MB1-up" in report for report in h.reports))
 
-    def test_right_button_has_no_controller_route_or_state_effect(self) -> None:
+    def test_physical_right_button_tracks_aim_without_macro_state_effect(self) -> None:
         h = SimulationHarness(CONFIG, trace=False)
         h.start(WeaponMode.PRIMARY)
-        before = (h.machine.state, h.machine.generation, tuple(h.audio.events))
+        before = (
+            h.machine.state,
+            h.machine.generation,
+            h.machine.magazine_state(WeaponMode.PRIMARY),
+            h.machine.worker,
+            tuple(h.audio.events),
+            len(h.backend.events),
+        )
         self.assertFalse(h.policy.mouse(WM_RBUTTONDOWN, 0, 0))
         self.assertFalse(h.policy.mouse(WM_RBUTTONUP, 0, 0))
         h.drain()
+        self.assertIs(h.machine.aim_state, AimState.AIM_ON)
         self.assertEqual(
-            before, (h.machine.state, h.machine.generation, tuple(h.audio.events))
+            before,
+            (
+                h.machine.state,
+                h.machine.generation,
+                h.machine.magazine_state(WeaponMode.PRIMARY),
+                h.machine.worker,
+                tuple(h.audio.events),
+                len(h.backend.events),
+            ),
         )
-        self.assertFalse(any("RIGHT" in name for name in ControlEventKind.__members__))
+        self.assertFalse(h.policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(h.policy.mouse(WM_RBUTTONUP, 0, 0))
+        h.drain()
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
 
-    def test_shift_down_repeat_up_have_no_controller_route(self) -> None:
+    def test_right_button_does_not_cancel_macro_or_sprint_reload(self) -> None:
+        macro_reload = SimulationHarness(CONFIG, trace=False)
+        macro_reload.start(WeaponMode.PRIMARY)
+        macro = macro_reload.machine.worker
+        self.assertIsInstance(macro, FakeSessionWorker)
+        macro.begin_macro_reload()
+        macro_reload.drain()
+        before = (
+            macro_reload.machine.state,
+            macro_reload.machine.generation,
+            macro_reload.machine.worker,
+            tuple(macro_reload.audio.events),
+        )
+        self.assertFalse(macro_reload.policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(macro_reload.policy.mouse(WM_RBUTTONUP, 0, 0))
+        macro_reload.drain()
+        self.assertEqual(
+            before,
+            (
+                macro_reload.machine.state,
+                macro_reload.machine.generation,
+                macro_reload.machine.worker,
+                tuple(macro_reload.audio.events),
+            ),
+        )
+        self.assertIs(macro_reload.machine.aim_state, AimState.AIM_ON)
+
+        sprint = SimulationHarness(CONFIG, trace=False)
+        sprint.start(WeaponMode.PRIMARY)
+        sprint.auto_complete_preparation = False
+        sprint.key_press(VK_LSHIFT)
+        before = (
+            sprint.machine.state,
+            sprint.machine.generation,
+            sprint.machine.worker,
+            tuple(sprint.audio.events),
+        )
+        self.assertFalse(sprint.policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(sprint.policy.mouse(WM_RBUTTONUP, 0, 0))
+        sprint.drain()
+        self.assertEqual(
+            before,
+            (
+                sprint.machine.state,
+                sprint.machine.generation,
+                sprint.machine.worker,
+                tuple(sprint.audio.events),
+            ),
+        )
+        self.assertIs(sprint.machine.aim_state, AimState.AIM_ON)
+
+    def test_shift_conditionally_sends_one_aim_off_pair(self) -> None:
+        h = SimulationHarness(CONFIG, trace=True)
+        self.assertFalse(h.policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(h.policy.mouse(WM_RBUTTONUP, 0, 0))
+        h.drain()
+        self.assertIs(h.machine.aim_state, AimState.AIM_ON)
+        macro_generation = h.machine.generation
+        before = len(h.backend.events)
+
+        h.key_press(VK_LSHIFT, repeats=3)
+
+        self.assertEqual(
+            [name for name, _state in h.backend.events[before:]],
+            ["MB2_DOWN", "MB2_UP"],
+        )
+        self.assertTrue(
+            all(
+                source is EventSource.INJECTED_OWNED
+                for _name, source in h.backend.tagged_events[-2:]
+            )
+        )
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
+        self.assertEqual(h.machine.generation, macro_generation)
+        self.assertEqual(h.audio.events, [])
+        self.assertEqual(
+            sum("event=AIM_OFF_REQUESTED" in item for item in h.reports), 1
+        )
+        self.assertEqual(sum("event=AIM_OFF_SENT" in item for item in h.reports), 1)
+
+        delivered = len(h.backend.events)
+        h.key_press(VK_RSHIFT, repeats=2)
+        self.assertEqual(len(h.backend.events), delivered)
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
+
+    def test_shift_while_aim_off_or_unknown_never_generates_mb2(self) -> None:
+        off = SimulationHarness(CONFIG, trace=True)
+        off.key_press(VK_LSHIFT, repeats=2)
+        self.assertIs(off.machine.aim_state, AimState.AIM_OFF)
+        self.assertEqual(off.backend.events, [])
+        self.assertEqual(off.audio.events, [])
+
+        unknown = SimulationHarness(CONFIG, trace=True)
+        unknown.foreground_loss()
+        unknown.foreground.active = True
+        unknown.foreground.certain = True
+        unknown.key_press(VK_RSHIFT, repeats=2)
+        self.assertIs(unknown.machine.aim_state, AimState.UNKNOWN)
+        self.assertEqual(unknown.backend.events, [])
+        self.assertEqual(unknown.audio.events, [])
+
+    def test_physical_mb2_invalidates_obsolete_pending_aim_worker(self) -> None:
+        h = SimulationHarness(
+            CONFIG,
+            trace=True,
+            auto_complete_cancel=False,
+            auto_complete_aim_off=False,
+        )
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        h.key_press(VK_LSHIFT)
+        worker = next(
+            item for item in h.workers if item.request.kind is WorkerKind.AIM_OFF
+        )
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF_PENDING)
+
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+
+        self.assertTrue(worker.cancel_requested)
+        self.assertIs(h.machine.aim_state, AimState.UNKNOWN)
+        self.assertEqual(h.backend.events, [])
+        worker.finish(WorkerResult(True))
+        h.drain()
+        self.assertIs(h.machine.aim_state, AimState.UNKNOWN)
+
+    def test_foreground_loss_invalidates_pending_aim_and_releases_mb2(self) -> None:
+        h = SimulationHarness(
+            CONFIG,
+            trace=True,
+            auto_complete_cancel=False,
+            auto_complete_aim_off=False,
+        )
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        h.key_press(VK_LSHIFT)
+        worker = next(
+            item for item in h.workers if item.request.kind is WorkerKind.AIM_OFF
+        )
+        worker.begin_aim_off()
+        self.assertTrue(h.backend.aim_owned)
+
+        h.foreground_loss()
+
+        self.assertFalse(h.backend.aim_owned)
+        self.assertIs(h.machine.aim_state, AimState.UNKNOWN)
+        self.assertTrue(worker.cancel_requested)
+
+    def test_failed_aim_off_delivery_publishes_unknown_without_retry(self) -> None:
+        h = SimulationHarness(CONFIG, trace=True, auto_complete_aim_off=False)
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        h.key_press(VK_LSHIFT)
+        worker = next(
+            item for item in h.workers if item.request.kind is WorkerKind.AIM_OFF
+        )
+
+        worker.finish(WorkerResult(False, error=RuntimeError("fake MB2 failure")))
+        h.drain()
+
+        self.assertIs(h.machine.aim_state, AimState.UNKNOWN)
+        self.assertEqual(h.backend.events, [])
+        self.assertEqual(
+            sum("event=AIM_OFF_FAILED" in item for item in h.reports),
+            1,
+        )
+        self.assertEqual(
+            sum(item.request.kind is WorkerKind.AIM_OFF for item in h.workers),
+            1,
+        )
+
+    def test_native_shift_aim_cancellation_never_generates_mb2(self) -> None:
+        native = replace(
+            CONFIG,
+            controls=replace(
+                CONFIG.controls,
+                shift_cancels_aim_natively=True,
+            ),
+        )
+        h = SimulationHarness(native, trace=True)
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        self.assertIs(h.machine.aim_state, AimState.AIM_ON)
+
+        h.key_press(VK_LSHIFT, repeats=3)
+
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
+        self.assertEqual(h.backend.events, [])
+        self.assertEqual(h.audio.events, [])
+
+    def test_shift_aim_off_does_not_change_sprint_reload_contract(self) -> None:
+        h = SimulationHarness(CONFIG, trace=True)
+        h.start(WeaponMode.PRIMARY)
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        before = len(h.backend.events)
+
+        h.key_press(VK_LSHIFT, repeats=2)
+
+        emitted = [name for name, _state in h.backend.events[before:]]
+        self.assertEqual(
+            emitted,
+            ["MB1_UP", "MB2_DOWN", "MB2_UP", "R_DOWN", "R_UP"],
+        )
+        self.assertEqual(h.audio.events, ["ON", "OFF"])
+        self.assertFalse(h.machine.enabled)
+        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.PRIMARY),
+            MagazineState.FULL,
+        )
+        self.assertEqual(emitted.count("R_DOWN"), 1)
+
+    def test_weapon_selection_does_not_toggle_assumed_aim(self) -> None:
         h = SimulationHarness(CONFIG, trace=False)
-        h.start(WeaponMode.SECONDARY)
-        before = (h.machine.state, h.machine.generation, tuple(h.audio.events))
-        for message in (WM_KEYDOWN, WM_KEYDOWN, WM_KEYUP):
-            self.assertFalse(h.policy.keyboard(message, VK_LSHIFT, 0))
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        self.assertIs(h.machine.aim_state, AimState.AIM_ON)
+
+        h.key_press(VK_2)
+
+        self.assertIs(h.machine.aim_state, AimState.AIM_ON)
+
+    def test_left_and_right_shift_stop_firing_once_then_reload_disabled(self) -> None:
+        for mode, vk_code in (
+            (WeaponMode.PRIMARY, VK_LSHIFT),
+            (WeaponMode.SECONDARY, VK_RSHIFT),
+        ):
+            with self.subTest(mode=mode):
+                h = SimulationHarness(CONFIG, trace=True)
+                h.start(mode)
+                before = len(h.backend.events)
+                results = h.key_press(vk_code, repeats=3)
+                self.assertTrue(all(result is False for result in results))
+                self.assertEqual(
+                    [name for name, _state in h.backend.events[before:]],
+                    ["MB1_UP", "R_DOWN", "R_UP"],
+                )
+                self.assertFalse(h.machine.enabled)
+                self.assertFalse(h.machine.firing)
+                self.assertIsNone(h.machine.worker)
+                self.assertIs(h.machine.magazine_state(mode), MagazineState.FULL)
+                self.assertEqual(h.audio.events, ["ON", "OFF"])
+                self.assertEqual(
+                    sum(
+                        worker.request.kind is WorkerKind.RELOAD_ONLY
+                        for worker in h.workers
+                    ),
+                    1,
+                )
+                disabled = [
+                    report
+                    for report in h.reports
+                    if "event=MACRO_DISABLED" in report
+                    and "reason=SHIFT_SPRINT" in report
+                ]
+                self.assertEqual(len(disabled), 1)
+
+    def test_shift_during_macro_reload_preserves_it_without_duplicate(self) -> None:
+        h = SimulationHarness(CONFIG, trace=True)
+        h.start(WeaponMode.PRIMARY)
+        macro = h.machine.worker
+        self.assertIsInstance(macro, FakeSessionWorker)
+        macro.begin_macro_reload()
+        h.drain()
+        reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+        h.key_press(VK_LSHIFT, repeats=2)
+        self.assertFalse(h.machine.enabled)
+        self.assertIs(h.machine.worker, macro)
+        self.assertTrue(macro.finish_after_reload_requested)
+        self.assertEqual(h.audio.events, ["ON", "OFF"])
+        macro.complete_macro_reload()
         h.drain()
         self.assertEqual(
-            before, (h.machine.state, h.machine.generation, tuple(h.audio.events))
+            sum(name == "R_DOWN" for name, _state in h.backend.events),
+            reloads,
         )
-        self.assertFalse(any("SHIFT" in name for name in ControlEventKind.__members__))
+        self.assertIsNone(h.machine.worker)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.PRIMARY),
+            MagazineState.FULL,
+        )
+        self.assertFalse(h.machine.enabled)
+
+    def test_shift_disabled_idle_and_preparation_are_state_neutral(self) -> None:
+        idle = SimulationHarness(CONFIG, trace=False)
+        before = (
+            idle.machine.state,
+            idle.machine.generation,
+            len(idle.workers),
+            tuple(idle.audio.events),
+        )
+        idle.key_press(VK_LSHIFT, repeats=3)
+        self.assertEqual(
+            before,
+            (
+                idle.machine.state,
+                idle.machine.generation,
+                len(idle.workers),
+                tuple(idle.audio.events),
+            ),
+        )
+
+        prep = SimulationHarness(
+            CONFIG,
+            trace=False,
+            auto_complete_preparation=False,
+        )
+        prep.key_press(VK_2)
+        worker = prep.machine.worker
+        generation = prep.machine.generation
+        prep.key_press(VK_RSHIFT, repeats=3)
+        self.assertIs(prep.machine.worker, worker)
+        self.assertEqual(prep.machine.generation, generation)
+        self.assertEqual(prep.audio.events, [])
+        self.assertIsInstance(worker, FakeSessionWorker)
+        self.assertFalse(worker.cancel_requested)
+
+    def test_stale_firing_completion_cannot_interfere_with_sprint_reload(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False, auto_complete_cancel=False)
+        h.start(WeaponMode.PRIMARY)
+        old = h.machine.worker
+        self.assertIsInstance(old, FakeSessionWorker)
+        h.key_press(VK_LSHIFT)
+        self.assertIs(h.machine.state, MacroState.STOPPING)
+        self.assertFalse(h.backend.mouse_owned)
+        self.assertEqual(h.audio.events, ["ON", "OFF"])
+        old.finish(WorkerResult(False, canceled=True))
+        h.drain()
+        self.assertIsNone(h.machine.worker)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.PRIMARY),
+            MagazineState.FULL,
+        )
+        worker_count = len(h.workers)
+        h.put_worker_event(
+            ControlEventKind.WORKER_STOPPED,
+            old,
+            WorkerResult(False, canceled=True),
+        )
+        h.drain()
+        self.assertEqual(len(h.workers), worker_count)
+        self.assertFalse(h.machine.enabled)
+
+    def test_foreground_loss_during_sprint_reload_cancels_and_releases_r(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False)
+        h.start(WeaponMode.PRIMARY)
+        h.auto_complete_preparation = False
+        h.key_press(VK_LSHIFT)
+        reload_worker = h.machine.worker
+        self.assertIsInstance(reload_worker, FakeSessionWorker)
+        self.assertIs(reload_worker.request.kind, WorkerKind.RELOAD_ONLY)
+        reload_worker.begin_reload()
+        self.assertTrue(h.backend.reload_owned)
+        h.foreground_loss()
+        self.assertFalse(h.backend.reload_owned)
+        self.assertFalse(h.machine.enabled)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.PRIMARY),
+            MagazineState.UNKNOWN,
+        )
+
+    def test_weapon_selection_invalidates_active_sprint_reload(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False)
+        h.start(WeaponMode.PRIMARY)
+        h.auto_complete_preparation = False
+        h.key_press(VK_LSHIFT)
+        reload_worker = h.machine.worker
+        self.assertIsInstance(reload_worker, FakeSessionWorker)
+        reload_worker.begin_reload()
+        h.key_press(VK_2)
+        self.assertFalse(h.backend.reload_owned)
+        self.assertIs(h.machine.selected_mode, WeaponMode.SECONDARY)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.PRIMARY),
+            MagazineState.UNKNOWN,
+        )
+        self.assertFalse(h.machine.enabled)
 
     def test_focus_loss_during_generated_down_is_atomic_and_no_restart(self) -> None:
         h = SimulationHarness(CONFIG, trace=False, auto_complete_cancel=False)

@@ -15,6 +15,13 @@ class MagazineState(Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class AimState(Enum):
+    AIM_OFF = auto()
+    AIM_ON = auto()
+    AIM_OFF_PENDING = auto()
+    UNKNOWN = auto()
+
+
 class PreparationLifecycle(Enum):
     IDLE_UNKNOWN = auto()
     PREPARING = auto()
@@ -31,12 +38,30 @@ class Mb1PairDecision(Enum):
 class WorkerKind(Enum):
     MACRO = auto()
     PREPARATION = auto()
+    RELOAD_ONLY = auto()
+    AIM_OFF = auto()
     BYPASS = auto()
 
 
 class WorkerProgress(Enum):
     SHOT_BEGAN = auto()
-    RELOAD_COMPLETE = auto()
+    FINAL_SHOT_DOWN = auto()
+    FINAL_SHOT_UP = auto()
+    RELOAD_KEY_DOWN = auto()
+    RELOAD_KEY_UP = auto()
+    RELOAD_WAIT_STARTED = auto()
+    RELOAD_COMPLETED = auto()
+    RELOAD_FAILED = auto()
+    # Compatibility alias for existing callers while trace output uses the
+    # approved RELOAD_COMPLETED diagnostic name.
+    RELOAD_COMPLETE = RELOAD_COMPLETED
+
+
+@dataclass(frozen=True)
+class WorkerProgressUpdate:
+    phase: WorkerProgress
+    occurred_at: float
+    reason: str
 
 
 class MacroState(Enum):
@@ -46,6 +71,8 @@ class MacroState(Enum):
     RUNNING_SECONDARY = auto()
     PREPARING_PRIMARY = auto()
     PREPARING_SECONDARY = auto()
+    RELOADING_PRIMARY = auto()
+    RELOADING_SECONDARY = auto()
     FORWARDING_BYPASS = auto()
     STOPPING = auto()
     SHUTTING_DOWN = auto()
@@ -54,6 +81,8 @@ class MacroState(Enum):
 class ControlEventKind(Enum):
     PHYSICAL_MB1_DOWN = auto()
     PHYSICAL_MB1_UP = auto()
+    PHYSICAL_MB2_DOWN = auto()
+    PHYSICAL_MB2_UP = auto()
     MANUAL_BYPASS_DOWN = auto()
     DEFERRED_BYPASS_DOWN = auto()
     DEFERRED_BYPASS_UP = auto()
@@ -61,6 +90,8 @@ class ControlEventKind(Enum):
     SELECT_SECONDARY = auto()
     CTRL_DOWN = auto()
     CTRL_UP = auto()
+    SHIFT_DOWN = auto()
+    SHIFT_UP = auto()
     FOREGROUND_LOST = auto()
     FOREGROUND_UNCERTAIN = auto()
     HOOK_FAILURE = auto()

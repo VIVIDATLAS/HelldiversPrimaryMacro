@@ -27,6 +27,7 @@ class ControlsConfig:
     poll_ms: int
     toggle_debounce_ms: int
     deferred_bypass_click_ms: int
+    shift_cancels_aim_natively: bool
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,9 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         ),
         deferred_bypass_click_ms=_value(
             controls_t, "controls", "deferred_bypass_click_ms", int
+        ),
+        shift_cancels_aim_natively=_value(
+            controls_t, "controls", "shift_cancels_aim_natively", bool
         ),
     )
     weapons = WeaponsConfig(

@@ -7,6 +7,7 @@ from typing import Callable, Protocol
 from .config import AppConfig
 from .input_backend import InputCoordination
 from .models import (
+    AimState,
     ControlEvent,
     ControlEventKind,
     EventSource,
@@ -16,6 +17,7 @@ from .models import (
     WeaponMode,
     WorkerKind,
     WorkerProgress,
+    WorkerProgressUpdate,
     WorkerRequest,
     WorkerResult,
 )
@@ -36,6 +38,11 @@ class WorkerHandle(Protocol):
     def cancel_and_release(self) -> BaseException | None: ...
     def join(self, timeout: float | None = None) -> None: ...
     def is_alive(self) -> bool: ...
+    def reload_in_progress(self) -> bool: ...
+    def sprint_stop(self) -> bool: ...
+    def cancel_aim_and_observe(
+        self,
+    ) -> tuple[bool, bool, BaseException | None]: ...
 
 
 WorkerFactory = Callable[[int, WorkerRequest], WorkerHandle]
@@ -92,6 +99,14 @@ class MacroStateMachine:
         self._firing_began = False
         self._macro_reload_invalidated = False
         self._preparation_invalidated = False
+        self._reload_only_invalidated = False
+        self._aim_state = AimState.AIM_OFF
+        self._aim_generation = 0
+        self._aim_worker: WorkerHandle | None = None
+        self._retired_aim_workers: dict[int, WorkerHandle] = {}
+        self._worker_phase = "IDLE"
+        self._preserved_macro_reload_token: int | None = None
+        self._pending_sprint_reload: tuple[WeaponMode, int] | None = None
         self._pending_selection: WeaponMode | None = None
         self._worker_cancel_reason: str | None = None
         self._deferred_release: threading.Event | None = None
@@ -121,12 +136,26 @@ class MacroStateMachine:
         return self._enabled
 
     @property
+    def aim_state(self) -> AimState:
+        return self._aim_state
+
+    @property
     def physical_mb1_down(self) -> bool:
         return self._physical_mb1_down
 
     @property
     def preparing(self) -> bool:
         return self._worker_kind is WorkerKind.PREPARATION
+
+    @property
+    def reloading(self) -> bool:
+        if self._worker_kind is WorkerKind.RELOAD_ONLY:
+            return True
+        return (
+            self._worker_kind is WorkerKind.MACRO
+            and self._worker is not None
+            and self._worker.reload_in_progress()
+        )
 
     @property
     def armed(self) -> bool:
@@ -168,6 +197,8 @@ class MacroStateMachine:
             "physical_mb1_down": self._physical_mb1_down,
             "neutral_rearm": self._neutral_rearm_required,
             "generation": self._generation,
+            "aim_state": self._aim_state.name,
+            "worker_phase": self._worker_phase,
             "foreground": self._foreground_label(),
         }
 
@@ -186,13 +217,15 @@ class MacroStateMachine:
         previous: dict[str, object],
         reason: str,
         rejected: bool = False,
+        occurred_at: float | None = None,
     ) -> None:
         if not self._config.diagnostics.state_tracing:
             return
         self._trace_sequence += 1
         normalized = event.strip().upper().replace(" ", "_")
         prefix = "START_REJECTED: " if rejected else "TRACE: "
-        elapsed_ms = (self._clock() - self._trace_started_at) * 1000.0
+        event_time = self._clock() if occurred_at is None else occurred_at
+        elapsed_ms = (event_time - self._trace_started_at) * 1000.0
         self._report(
             f"{prefix}seq={self._trace_sequence} elapsed_ms={elapsed_ms:.3f} "
             f"event={normalized} "
@@ -247,6 +280,13 @@ class MacroStateMachine:
             else MacroState.PREPARING_SECONDARY
         )
 
+    def _reloading_state(self) -> MacroState:
+        return (
+            MacroState.RELOADING_PRIMARY
+            if self.selected_mode is WeaponMode.PRIMARY
+            else MacroState.RELOADING_SECONDARY
+        )
+
     def handle(self, event: ControlEvent) -> None:
         if event.kind is ControlEventKind.DIAGNOSTIC:
             self._diagnostic(str(event.detail))
@@ -263,6 +303,10 @@ class MacroStateMachine:
             self._mb1_down(event.source)
         elif kind is ControlEventKind.PHYSICAL_MB1_UP:
             self._mb1_up()
+        elif kind is ControlEventKind.PHYSICAL_MB2_DOWN:
+            self._mb2_down(event.source)
+        elif kind is ControlEventKind.PHYSICAL_MB2_UP:
+            return
         elif kind is ControlEventKind.MANUAL_BYPASS_DOWN:
             self._manual_bypass(event.source)
         elif kind is ControlEventKind.DEFERRED_BYPASS_DOWN:
@@ -272,6 +316,10 @@ class MacroStateMachine:
         elif kind is ControlEventKind.CTRL_DOWN:
             self._ctrl_down(event.source)
         elif kind is ControlEventKind.CTRL_UP:
+            return
+        elif kind is ControlEventKind.SHIFT_DOWN:
+            self._shift_down(event.source)
+        elif kind is ControlEventKind.SHIFT_UP:
             return
         elif kind in (
             ControlEventKind.FOREGROUND_LOST,
@@ -305,6 +353,7 @@ class MacroStateMachine:
             return
         if self._foreground_active():
             self._foreground_loss_latched = False
+        self._pending_sprint_reload = None
 
         if self._enabled:
             self._disable("weapon selection", source)
@@ -315,6 +364,8 @@ class MacroStateMachine:
                 self._generation += 1
             if self._worker_kind is WorkerKind.PREPARATION:
                 self._preparation_invalidated = True
+            if self._worker_kind is WorkerKind.RELOAD_ONLY:
+                self._reload_only_invalidated = True
             if self._worker_kind is WorkerKind.MACRO:
                 self._macro_reload_invalidated = True
 
@@ -409,6 +460,32 @@ class MacroStateMachine:
         # toggle enabled state, start preparation, or emit audio.
         self._physical_mb1_down = False
         self._neutral_rearm_required = False
+
+    def _mb2_down(self, source: EventSource) -> None:
+        previous = self._snapshot()
+        if self._aim_state is AimState.AIM_OFF_PENDING:
+            self._invalidate_pending_aim(
+                "physical MB2 invalidated pending aim-off output",
+                source,
+            )
+            return
+        if self._aim_state is AimState.AIM_OFF:
+            self._aim_state = AimState.AIM_ON
+            event_name = "AIM_PHYSICAL_ON"
+            reason = "physical toggle-aim MB2-down assumed aim ON"
+        elif self._aim_state is AimState.AIM_ON:
+            self._aim_state = AimState.AIM_OFF
+            event_name = "AIM_PHYSICAL_OFF"
+            reason = "physical toggle-aim MB2-down assumed aim OFF"
+        else:
+            # A physical toggle cannot recover a known state from UNKNOWN.
+            return
+        self._trace(
+            event_name,
+            source=source,
+            previous=previous,
+            reason=reason,
+        )
 
     def _start_macro(self, source: EventSource, reason: str) -> None:
         previous = self._snapshot()
@@ -557,6 +634,7 @@ class MacroStateMachine:
         self._worker = worker
         self._worker_kind = request.kind
         self._worker_mode = request.mode
+        self._worker_phase = f"{request.kind.name}_STARTING"
         if request.kind is WorkerKind.MACRO:
             self._coordination.macro_started()
         try:
@@ -586,6 +664,7 @@ class MacroStateMachine:
             self._worker = None
             self._worker_kind = None
             self._worker_mode = None
+            self._worker_phase = "IDLE"
             self._set_state(self._idle_state())
             self._report(f"{request.kind.name.title()} worker failed to start: {exc}")
             if release_error is not None:
@@ -608,6 +687,9 @@ class MacroStateMachine:
             self._generation += 1
             self._preparation_invalidated = self.preparing
             self._macro_reload_invalidated = self.running
+            self._reload_only_invalidated = (
+                self._worker_kind is WorkerKind.RELOAD_ONLY
+            )
             self._request_stop("manual Ctrl+MB1")
         self._diagnostic("Ctrl+MB1 passed through; selected magazine marked UNKNOWN")
         self._trace(
@@ -632,6 +714,9 @@ class MacroStateMachine:
             self._generation += 1
             self._preparation_invalidated = self.preparing
             self._macro_reload_invalidated = self.running
+            self._reload_only_invalidated = (
+                self._worker_kind is WorkerKind.RELOAD_ONLY
+            )
             self._request_stop("deferred Ctrl+MB1")
         else:
             self._start_deferred_bypass()
@@ -691,11 +776,169 @@ class MacroStateMachine:
         if self._enabled:
             self._disable("CTRL_DOWN", source)
 
+    def _shift_down(self, source: EventSource) -> None:
+        # The hook always passes Shift through. Macro sprint-stop behavior is
+        # conditional on enabled state; aim cancellation is independent.
+        if self._enabled:
+            previous = self._snapshot()
+            worker = self._worker
+            mode = self._worker_mode or self.selected_mode
+            self._enabled = False
+            self._generation += 1
+            self._off_pending = True
+
+            preserved_reload = False
+            if worker is not None and self._worker_kind is WorkerKind.MACRO:
+                try:
+                    preserved_reload = worker.sprint_stop()
+                except BaseException as exc:
+                    self._report(f"Shift sprint-stop cleanup failed: {exc}")
+                    self._macro_reload_invalidated = True
+                    self._worker_cancel_reason = "SHIFT_SPRINT"
+                    self._coordination.cleanup_requested()
+                    self._set_state(MacroState.STOPPING)
+                else:
+                    if preserved_reload:
+                        self._preserved_macro_reload_token = worker.token
+                        self._macro_reload_invalidated = False
+                        self._worker_cancel_reason = "SHIFT_SPRINT"
+                        self._set_state(self._reloading_state())
+                    else:
+                        self._macro_reload_invalidated = True
+                        self._pending_sprint_reload = (mode, self._generation)
+                        self._worker_cancel_reason = "SHIFT_SPRINT"
+                        self._coordination.cleanup_requested()
+                        self._set_state(MacroState.STOPPING)
+            else:
+                self._set_state(self._idle_state())
+
+            self._trace(
+                "MACRO_DISABLED",
+                source=source,
+                previous=previous,
+                reason="SHIFT_SPRINT",
+            )
+            # Shift OFF is queued immediately and deduplicated by _off_pending;
+            # it does not wait for firing cleanup or the allowed sprint reload.
+            self._finish_off()
+
+        self._shift_aim(source)
+
+    def _shift_aim(self, source: EventSource) -> None:
+        previous = self._snapshot()
+        if self._config.controls.shift_cancels_aim_natively:
+            self._aim_generation += 1
+            self._aim_state = AimState.AIM_OFF
+            self._trace(
+                "AIM_OFF_SKIPPED",
+                source=source,
+                previous=previous,
+                reason="Shift natively cancels aim; no generated MB2",
+            )
+            return
+        if self._aim_state is not AimState.AIM_ON:
+            self._trace(
+                "AIM_OFF_SKIPPED",
+                source=source,
+                previous=previous,
+                reason=f"conditional aim-off skipped from {self._aim_state.name}",
+            )
+            return
+
+        self._aim_generation += 1
+        self._aim_state = AimState.AIM_OFF_PENDING
+        self._trace(
+            "AIM_OFF_REQUESTED",
+            source=source,
+            previous=previous,
+            reason="Shift requested one conditional owned MB2 pair",
+        )
+        self._start_aim_off_worker(source)
+
+    def _start_aim_off_worker(self, source: EventSource) -> None:
+        previous = self._snapshot()
+        if self._aim_worker is not None:
+            self._aim_state = AimState.UNKNOWN
+            self._trace(
+                "AIM_OFF_FAILED",
+                source=source,
+                previous=previous,
+                reason="an aim-off worker is already active",
+            )
+            return
+        token = self._next_worker_token
+        self._next_worker_token += 1
+        request = WorkerRequest(
+            WorkerKind.AIM_OFF,
+            self.selected_mode,
+            generation=self._aim_generation,
+        )
+        try:
+            worker = self._worker_factory(token, request)
+        except BaseException as exc:
+            self._aim_state = AimState.UNKNOWN
+            self._report(f"Aim-off worker failed to construct: {exc}")
+            self._trace(
+                "AIM_OFF_FAILED",
+                source=source,
+                previous=previous,
+                reason=f"worker construction failed: {exc}",
+            )
+            return
+        self._aim_worker = worker
+        try:
+            worker.start()
+            worker.activate()
+        except BaseException as exc:
+            _started, _sent, release_error = worker.cancel_aim_and_observe()
+            self._retired_aim_workers[worker.token] = worker
+            self._aim_worker = None
+            self._aim_state = AimState.UNKNOWN
+            self._report(f"Aim-off worker failed to start: {exc}")
+            if release_error is not None:
+                self._report(f"Generated MB2 release failed: {release_error}")
+            self._trace(
+                "AIM_OFF_FAILED",
+                source=source,
+                previous=previous,
+                reason=f"worker startup failed: {exc}",
+            )
+
+    def _invalidate_pending_aim(self, reason: str, source: EventSource) -> None:
+        previous = self._snapshot()
+        self._aim_generation += 1
+        worker = self._aim_worker
+        release_error: BaseException | None = None
+        if worker is not None:
+            _started, _sent, release_error = worker.cancel_aim_and_observe()
+            self._retired_aim_workers[worker.token] = worker
+            self._aim_worker = None
+        self._aim_state = AimState.UNKNOWN
+        if release_error is not None:
+            self._report(f"Generated MB2 release failed: {release_error}")
+        self._trace(
+            "AIM_OFF_FAILED",
+            source=source,
+            previous=previous,
+            reason=reason,
+        )
+
     def _foreground_lost(self, reason: str, source: EventSource) -> None:
         previous = self._snapshot()
         if self._foreground_loss_latched:
             return
         self._foreground_loss_latched = True
+        if (
+            self._aim_state is AimState.AIM_OFF_PENDING
+            or self._aim_worker is not None
+        ):
+            self._invalidate_pending_aim(
+                f"foreground loss invalidated aim-off output: {reason}",
+                source,
+            )
+        else:
+            self._aim_generation += 1
+            self._aim_state = AimState.UNKNOWN
         was_enabled = self._enabled
         self._enabled = False
         self._neutral_rearm_required = True
@@ -705,6 +948,10 @@ class MacroStateMachine:
             self._off_pending = True
         self._macro_reload_invalidated = self.running
         self._preparation_invalidated = self.preparing
+        self._reload_only_invalidated = (
+            self._worker_kind is WorkerKind.RELOAD_ONLY
+        )
+        self._pending_sprint_reload = None
         self._discard_deferred_bypass()
         affected_mode = self._worker_mode
         if affected_mode is not None:
@@ -734,6 +981,8 @@ class MacroStateMachine:
         if self._worker_kind is WorkerKind.PREPARATION and self._worker_mode is not None:
             self._preparation_invalidated = True
             self._magazines[self._worker_mode] = MagazineState.UNKNOWN
+        if self._worker_kind is WorkerKind.RELOAD_ONLY:
+            self._reload_only_invalidated = True
         self._set_state(MacroState.STOPPING)
         if self._worker_kind is WorkerKind.PREPARATION:
             # Preparation cancellation is event-only and never waits for its
@@ -750,27 +999,153 @@ class MacroStateMachine:
     def _worker_progress(self, event: ControlEvent) -> None:
         if self._worker is None or event.worker_token != self._worker.token:
             return
-        if self._worker_kind is not WorkerKind.MACRO or self._worker_mode is None:
+        if self._worker_mode is None:
             return
-        if self._worker.request.generation != self._generation or not self._enabled:
+        update = (
+            event.detail
+            if isinstance(event.detail, WorkerProgressUpdate)
+            else WorkerProgressUpdate(
+                event.detail,
+                self._clock(),
+                "worker phase update",
+            )
+            if isinstance(event.detail, WorkerProgress)
+            else None
+        )
+        if update is None:
             return
-        if event.detail is WorkerProgress.SHOT_BEGAN:
+        previous = self._snapshot()
+        self._worker_phase = update.phase.name
+        if update.phase is not WorkerProgress.SHOT_BEGAN:
+            self._trace(
+                update.phase.name,
+                source=EventSource.WORKER,
+                previous=previous,
+                reason=update.reason,
+                occurred_at=update.occurred_at,
+            )
+
+        if self._worker_kind is WorkerKind.RELOAD_ONLY:
+            if update.phase is WorkerProgress.RELOAD_FAILED:
+                self._reload_only_invalidated = True
+            return
+        if self._worker_kind is WorkerKind.PREPARATION:
+            if update.phase is WorkerProgress.RELOAD_FAILED:
+                self._preparation_invalidated = True
+            return
+        if self._worker_kind is not WorkerKind.MACRO:
+            return
+
+        generation_matches = self._worker.request.generation == self._generation
+        preserved_reload = event.worker_token == self._preserved_macro_reload_token
+        if update.phase is WorkerProgress.SHOT_BEGAN:
+            if not generation_matches or not self._enabled:
+                return
             self._firing_began = True
             self._magazines[self._worker_mode] = MagazineState.UNKNOWN
             self._set_preparation_lifecycle(
                 self._worker_mode, PreparationLifecycle.IDLE_UNKNOWN
             )
             self._armed = False
-        elif event.detail is WorkerProgress.RELOAD_COMPLETE:
-            if not self._macro_reload_invalidated and self._foreground_active():
+        elif update.phase is WorkerProgress.RELOAD_COMPLETED:
+            valid_authority = (
+                generation_matches and self._enabled
+            ) or preserved_reload
+            if (
+                valid_authority
+                and not self._macro_reload_invalidated
+                and self._foreground_active()
+                and self._worker_mode is self.selected_mode
+            ):
                 self._magazines[self._worker_mode] = MagazineState.FULL
                 self._armed = True
                 self._set_preparation_lifecycle(
                     self._worker_mode, PreparationLifecycle.IDLE_FULL_ARMED
                 )
+        elif update.phase is WorkerProgress.RELOAD_FAILED:
+            self._macro_reload_invalidated = True
+
+    def _start_reload_only(self, mode: WeaponMode, generation: int) -> None:
+        previous = self._snapshot()
+        if (
+            generation != self._generation
+            or mode is not self.selected_mode
+            or not self._foreground_active()
+            or self._worker is not None
+        ):
+            return
+        self._reload_only_invalidated = False
+        self._magazines[mode] = MagazineState.UNKNOWN
+        self._armed = False
+        request = WorkerRequest(
+            WorkerKind.RELOAD_ONLY,
+            mode,
+            generation=generation,
+        )
+        if not self._start_worker(request, self._reloading_state()):
+            self._reload_only_invalidated = True
+            self._set_state(self._idle_state())
+            return
+        self._trace(
+            "SPRINT_RELOAD_STARTED",
+            source=EventSource.WORKER,
+            previous=previous,
+            reason="SHIFT_SPRINT firing cleanup completed",
+        )
 
     def _worker_stopped(self, event: ControlEvent) -> None:
         previous = self._snapshot()
+        retired_aim = (
+            self._retired_aim_workers.pop(event.worker_token, None)
+            if event.worker_token is not None
+            else None
+        )
+        if retired_aim is not None:
+            return
+        if (
+            self._aim_worker is not None
+            and event.worker_token == self._aim_worker.token
+        ):
+            result = (
+                event.detail
+                if isinstance(event.detail, WorkerResult)
+                else WorkerResult(
+                    False,
+                    error=RuntimeError(f"invalid aim worker result {event.detail!r}"),
+                )
+            )
+            request = self._aim_worker.request
+            self._aim_worker = None
+            aim_succeeded = (
+                result.success
+                and not result.canceled
+                and result.error is None
+                and request.generation == self._aim_generation
+                and self._aim_state is AimState.AIM_OFF_PENDING
+                and self._foreground_active()
+            )
+            if aim_succeeded:
+                self._aim_state = AimState.AIM_OFF
+                self._trace(
+                    "AIM_OFF_SENT",
+                    source=EventSource.WORKER,
+                    previous=previous,
+                    reason="one owned tagged MB2 pair completed",
+                )
+            else:
+                self._aim_state = AimState.UNKNOWN
+                reason = (
+                    f"aim-off output error: {result.error}"
+                    if result.error is not None
+                    else "aim-off output was canceled or obsolete"
+                )
+                self._trace(
+                    "AIM_OFF_FAILED",
+                    source=EventSource.WORKER,
+                    previous=previous,
+                    reason=reason,
+                )
+            return
         retired = (
             self._retired_preparations.pop(event.worker_token, None)
             if event.worker_token is not None
@@ -805,10 +1180,15 @@ class MacroStateMachine:
         request = self._worker.request
         cancellation_reason = self._worker_cancel_reason
         generation_matches = request.generation == self._generation
+        preserved_macro_reload = (
+            kind is WorkerKind.MACRO
+            and event.worker_token == self._preserved_macro_reload_token
+        )
         self._worker = None
         self._worker_kind = None
         self._worker_mode = None
         self._worker_cancel_reason = None
+        self._worker_phase = "IDLE"
         if kind is WorkerKind.MACRO:
             self._coordination.cleanup_completed()
 
@@ -872,7 +1252,16 @@ class MacroStateMachine:
             if result.error is not None:
                 self._report(f"Macro stopped after error: {result.error}")
                 self._discard_deferred_bypass()
-            if mode is not None and (
+            preserved_reload_succeeded = (
+                preserved_macro_reload
+                and result.success
+                and not result.canceled
+                and result.error is None
+                and not self._macro_reload_invalidated
+                and mode is not None
+                and self._magazines[mode] is MagazineState.FULL
+            )
+            if mode is not None and not preserved_reload_succeeded and (
                 result.error is not None
                 or self._firing_began
                 or self._macro_reload_invalidated
@@ -894,6 +1283,49 @@ class MacroStateMachine:
                 reason=cancellation_reason
                 or (f"input API failure: {result.error}" if result.error else "worker stopped"),
             )
+            if preserved_macro_reload:
+                self._preserved_macro_reload_token = None
+
+        elif kind is WorkerKind.RELOAD_ONLY:
+            reload_succeeded = (
+                result.success
+                and not result.canceled
+                and result.error is None
+                and not self._reload_only_invalidated
+                and generation_matches
+                and self._foreground_active()
+                and mode is not None
+                and mode is self.selected_mode
+            )
+            if reload_succeeded and mode is not None:
+                self._magazines[mode] = MagazineState.FULL
+                self._armed = True
+                self._set_preparation_lifecycle(
+                    mode, PreparationLifecycle.IDLE_FULL_ARMED
+                )
+                reason = "SHIFT_SPRINT reload completed while macro disabled"
+                event_name = "SPRINT_RELOAD_COMPLETED"
+            else:
+                if mode is not None:
+                    self._magazines[mode] = MagazineState.UNKNOWN
+                    self._set_preparation_lifecycle(
+                        mode, PreparationLifecycle.IDLE_UNKNOWN
+                    )
+                self._armed = False
+                reason = (
+                    f"input/foreground error: {result.error}"
+                    if result.error is not None
+                    else cancellation_reason or "sprint reload invalidated"
+                )
+                event_name = "SPRINT_RELOAD_FAILED"
+            self._set_state(self._idle_state())
+            self._trace(
+                event_name,
+                source=EventSource.WORKER,
+                previous=previous,
+                reason=reason,
+            )
+            self._reload_only_invalidated = False
 
         elif kind is WorkerKind.BYPASS:
             if mode is not None:
@@ -916,6 +1348,12 @@ class MacroStateMachine:
         if self._pending_selection is not None:
             self._pending_selection = None
             self._begin_selection_preparation(EventSource.PHYSICAL)
+            return
+        if self._pending_sprint_reload is not None and kind is WorkerKind.MACRO:
+            sprint_mode, sprint_generation = self._pending_sprint_reload
+            self._pending_sprint_reload = None
+            if result.error is None:
+                self._start_reload_only(sprint_mode, sprint_generation)
             return
         if (
             kind is not WorkerKind.BYPASS
@@ -948,7 +1386,11 @@ class MacroStateMachine:
         return "worker did not verify reload completion"
 
     def shutdown(self) -> None:
-        if self.state is MacroState.SHUTTING_DOWN and self._worker is None:
+        if (
+            self.state is MacroState.SHUTTING_DOWN
+            and self._worker is None
+            and self._aim_worker is None
+        ):
             return
         previous = self._snapshot()
         was_enabled = self._enabled
@@ -959,9 +1401,27 @@ class MacroStateMachine:
         self._neutral_rearm_required = True
         self._macro_reload_invalidated = True
         self._preparation_invalidated = True
+        self._reload_only_invalidated = True
+        self._aim_generation += 1
+        self._aim_state = AimState.UNKNOWN
+        self._pending_sprint_reload = None
+        self._preserved_macro_reload_token = None
         if was_enabled:
             self._off_pending = True
         self._discard_deferred_bypass()
+        aim_worker = self._aim_worker
+        if aim_worker is not None:
+            _started, _sent, aim_release_error = (
+                aim_worker.cancel_aim_and_observe()
+            )
+            if aim_release_error is not None:
+                self._report(
+                    f"Generated MB2 release failed: {aim_release_error}"
+                )
+            aim_worker.join(2.0)
+            if aim_worker.is_alive():
+                self._report("Aim-off worker did not exit within 2 seconds")
+            self._aim_worker = None
         worker = self._worker
         if worker is not None:
             if self._worker_mode is not None:
@@ -984,9 +1444,14 @@ class MacroStateMachine:
             self._worker = None
             self._worker_kind = None
             self._worker_mode = None
+            self._worker_phase = "IDLE"
         for retired_worker in self._retired_preparations.values():
             retired_worker.cancel()
         self._retired_preparations.clear()
+        for retired_aim in self._retired_aim_workers.values():
+            retired_aim.cancel_aim_and_observe()
+            retired_aim.join(2.0)
+        self._retired_aim_workers.clear()
         self._coordination.cleanup_completed()
         self._finish_off()
         self._trace(

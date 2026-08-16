@@ -92,6 +92,7 @@ class HookPolicy:
         self._keys_down: set[int] = set()
         self._left_pair_decision: Mb1PairDecision | None = None
         self._left_pair_is_manual = False
+        self._right_pair_down = False
 
     @property
     def ctrl_down(self) -> bool:
@@ -136,9 +137,10 @@ class HookPolicy:
                     )
                 self._emit(ControlEventKind.CTRL_DOWN)
             elif vk_code in (VK_LSHIFT, VK_RSHIFT):
-                # Shift state is observed only to maintain a correct physical
-                # edge latch. It has no controller route or macro semantics.
-                pass
+                # Shift always passes through. Only its first physical down
+                # edge is normalized for the controller; repeats are rejected
+                # by the key latch above.
+                self._emit(ControlEventKind.SHIFT_DOWN, detail=vk_code)
             elif vk_code in (VK_1, VK_2):
                 active, certain = self._foreground_status()
                 if active:
@@ -157,6 +159,8 @@ class HookPolicy:
             self._keys_down.discard(vk_code)
             if was_down and vk_code in (VK_LCONTROL, VK_RCONTROL):
                 self._emit(ControlEventKind.CTRL_UP)
+            elif was_down and vk_code in (VK_LSHIFT, VK_RSHIFT):
+                self._emit(ControlEventKind.SHIFT_UP, detail=vk_code)
         return False
 
     def mouse(self, message: int, flags: int, extra_info: int) -> bool:
@@ -164,6 +168,21 @@ class HookPolicy:
         pointer_mask = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
         marked = (int(extra_info) & pointer_mask) == (INPUT_MARKER & pointer_mask)
         if marked or flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED):
+            return False
+
+        if message == WM_RBUTTONDOWN:
+            if self._right_pair_down:
+                return False
+            self._right_pair_down = True
+            active, _certain = self._foreground_status()
+            if active:
+                self._emit(ControlEventKind.PHYSICAL_MB2_DOWN)
+            return False
+        if message == WM_RBUTTONUP:
+            was_down = self._right_pair_down
+            self._right_pair_down = False
+            if was_down:
+                self._emit(ControlEventKind.PHYSICAL_MB2_UP)
             return False
 
         if message == WM_LBUTTONDOWN:

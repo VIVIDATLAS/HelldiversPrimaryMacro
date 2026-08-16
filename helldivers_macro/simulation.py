@@ -13,6 +13,7 @@ from .input_hooks import (
     VK_2,
     VK_LCONTROL,
     VK_LSHIFT,
+    VK_RSHIFT,
     WM_KEYDOWN,
     WM_KEYUP,
     WM_LBUTTONDOWN,
@@ -22,6 +23,7 @@ from .input_hooks import (
 )
 from .macro_engine import MacroEngine, primary_cycle_steps, secondary_cycle_steps
 from .models import (
+    AimState,
     ControlEvent,
     ControlEventKind,
     EventSource,
@@ -31,6 +33,7 @@ from .models import (
     WeaponMode,
     WorkerKind,
     WorkerProgress,
+    WorkerProgressUpdate,
     WorkerRequest,
     WorkerResult,
 )
@@ -89,6 +92,7 @@ class FakeGeneratedInput:
         self.timed_events: list[tuple[str, int]] = []
         self.tagged_events: list[tuple[str, EventSource]] = []
         self.mouse_owned = False
+        self.aim_owned = False
         self.reload_owned = False
 
     def _record(self, name: str) -> None:
@@ -116,6 +120,17 @@ class FakeGeneratedInput:
             self._record("MB1_UP")
             self.mouse_owned = False
 
+    def aim_down(self) -> None:
+        if self.aim_owned:
+            raise RuntimeError("fake duplicate MB2 down")
+        self._record("MB2_DOWN")
+        self.aim_owned = True
+
+    def aim_up(self) -> None:
+        if self.aim_owned:
+            self._record("MB2_UP")
+            self.aim_owned = False
+
     def reload_down(self) -> None:
         if self.reload_owned:
             raise RuntimeError("fake duplicate R down")
@@ -129,6 +144,7 @@ class FakeGeneratedInput:
 
     def release_all(self) -> None:
         self.mouse_up()
+        self.aim_up()
         self.reload_up()
 
 
@@ -148,7 +164,19 @@ class FakeSessionWorker:
         self.activated = False
         self.completed = False
         self.cancel_requested = False
+        self.finish_after_reload_requested = False
+        self.reload_started = False
+        self.reload_completed = False
+        self.aim_started = False
+        self.aim_sent = False
         self.alive = False
+
+    def progress(self, phase: WorkerProgress, reason: str) -> None:
+        self.harness.put_worker_event(
+            ControlEventKind.WORKER_PROGRESS,
+            self,
+            WorkerProgressUpdate(phase, self.harness.clock(), reason),
+        )
 
     def start(self) -> None:
         self.started = True
@@ -158,16 +186,18 @@ class FakeSessionWorker:
         if self.activated:
             return
         self.activated = True
-        if self.request.kind is WorkerKind.PREPARATION:
+        if self.request.kind in (
+            WorkerKind.PREPARATION,
+            WorkerKind.RELOAD_ONLY,
+        ):
             if self.harness.auto_complete_preparation:
                 self.finish_preparation()
         elif self.request.kind is WorkerKind.MACRO:
             self.harness.backend.mouse_down()
-            self.harness.put_worker_event(
-                ControlEventKind.WORKER_PROGRESS,
-                self,
-                WorkerProgress.SHOT_BEGAN,
-            )
+            self.progress(WorkerProgress.SHOT_BEGAN, "generated shot began")
+        elif self.request.kind is WorkerKind.AIM_OFF:
+            if self.harness.auto_complete_aim_off:
+                self.finish_aim_off()
         elif self.request.kind is WorkerKind.BYPASS:
             self.harness.backend.release_all()
             if not self.harness.foreground.is_confirmed_active():
@@ -186,12 +216,20 @@ class FakeSessionWorker:
                 self.request.switch_settle_ms,
                 threading.Event(),
                 threading.Event(),
+                lambda update: self.harness.put_worker_event(
+                    ControlEventKind.WORKER_PROGRESS,
+                    self,
+                    update,
+                ),
             )
         self.finish(result)
 
     def begin_reload(self) -> None:
-        if self.request.kind is not WorkerKind.PREPARATION or self.completed:
-            raise AssertionError("only an active preparation can begin reload")
+        if self.request.kind not in (
+            WorkerKind.PREPARATION,
+            WorkerKind.RELOAD_ONLY,
+        ) or self.completed:
+            raise AssertionError("only an active reload worker can begin reload")
         self.harness.backend.reload_down()
 
     def complete_cycle_reload(self) -> None:
@@ -202,38 +240,100 @@ class FakeSessionWorker:
             if self.request.mode is WeaponMode.PRIMARY
             else secondary_cycle_steps(self.harness.config)
         )
+        shot_count = 1
+        total_shots = (
+            self.harness.config.primary.shots_per_cycle
+            if self.request.mode is WeaponMode.PRIMARY
+            else self.harness.config.secondary.shots_per_cycle
+        )
         # activate() already scheduled the cycle's first MB1-down.
         for step in steps[1:]:
             if step.action is OutputAction.WAIT:
                 self.harness.clock.advance_ms(step.duration_ms)
             elif step.action is OutputAction.MB1_DOWN:
                 self.harness.backend.mouse_down()
-                self.harness.put_worker_event(
-                    ControlEventKind.WORKER_PROGRESS,
-                    self,
-                    WorkerProgress.SHOT_BEGAN,
-                )
+                shot_count += 1
+                self.progress(WorkerProgress.SHOT_BEGAN, "generated shot began")
+                if shot_count == total_shots:
+                    self.progress(
+                        WorkerProgress.FINAL_SHOT_DOWN,
+                        "final configured shot pressed",
+                    )
             elif step.action is OutputAction.MB1_UP:
                 self.harness.backend.mouse_up()
+                if shot_count == total_shots:
+                    self.progress(
+                        WorkerProgress.FINAL_SHOT_UP,
+                        "final configured shot released",
+                    )
             elif step.action is OutputAction.R_DOWN:
                 self.harness.backend.reload_down()
+                self.reload_started = True
+                self.progress(
+                    WorkerProgress.RELOAD_KEY_DOWN,
+                    "reload key pressed after firing phase",
+                )
             elif step.action is OutputAction.R_UP:
                 self.harness.backend.reload_up()
-        self.harness.put_worker_event(
-            ControlEventKind.WORKER_PROGRESS,
-            self,
-            WorkerProgress.RELOAD_COMPLETE,
+                self.progress(
+                    WorkerProgress.RELOAD_KEY_UP,
+                    "configured reload key press completed",
+                )
+                self.progress(
+                    WorkerProgress.RELOAD_WAIT_STARTED,
+                    "reload wait began after R-up",
+                )
+        self.reload_completed = True
+        self.progress(
+            WorkerProgress.RELOAD_COMPLETED,
+            "configured reload wait completed",
         )
+        if self.finish_after_reload_requested:
+            self.finish(WorkerResult(True))
+
+    def begin_macro_reload(self) -> None:
+        if self.request.kind is not WorkerKind.MACRO or self.completed:
+            raise AssertionError("only an active macro can begin reload")
+        self.harness.backend.mouse_up()
+        self.harness.backend.reload_down()
+        self.reload_started = True
+        self.progress(
+            WorkerProgress.RELOAD_KEY_DOWN,
+            "reload key pressed after firing phase",
+        )
+
+    def complete_macro_reload(self) -> None:
+        if not self.reload_in_progress() or self.completed:
+            raise AssertionError("macro reload is not active")
+        weapon = (
+            self.harness.config.primary
+            if self.request.mode is WeaponMode.PRIMARY
+            else self.harness.config.secondary
+        )
+        self.harness.clock.advance_ms(weapon.reload_press_ms)
+        self.harness.backend.reload_up()
+        self.progress(
+            WorkerProgress.RELOAD_KEY_UP,
+            "configured reload key press completed",
+        )
+        self.progress(
+            WorkerProgress.RELOAD_WAIT_STARTED,
+            "reload wait began after R-up",
+        )
+        self.harness.clock.advance_ms(weapon.reload_wait_ms)
+        self.reload_completed = True
+        self.progress(
+            WorkerProgress.RELOAD_COMPLETED,
+            "configured reload wait completed",
+        )
+        if self.finish_after_reload_requested:
+            self.finish(WorkerResult(True))
 
     def begin_next_cycle(self) -> None:
         if self.request.kind is not WorkerKind.MACRO or self.completed:
             raise AssertionError("only an active macro can begin another cycle")
         self.harness.backend.mouse_down()
-        self.harness.put_worker_event(
-            ControlEventKind.WORKER_PROGRESS,
-            self,
-            WorkerProgress.SHOT_BEGAN,
-        )
+        self.progress(WorkerProgress.SHOT_BEGAN, "generated shot began")
 
     def finish_bypass_release(self) -> None:
         if self.request.kind is not WorkerKind.BYPASS or self.completed:
@@ -243,11 +343,28 @@ class FakeSessionWorker:
             self.harness.backend.mouse_up()
             self.finish(WorkerResult(True))
 
+    def begin_aim_off(self) -> None:
+        if self.request.kind is not WorkerKind.AIM_OFF or self.completed:
+            raise AssertionError("only an active aim-off worker can begin output")
+        self.harness.backend.aim_down()
+        self.aim_started = True
+
+    def finish_aim_off(self) -> None:
+        if self.request.kind is not WorkerKind.AIM_OFF or self.completed:
+            raise AssertionError("only an active aim-off worker can finish output")
+        if not self.aim_started:
+            self.begin_aim_off()
+        self.harness.backend.aim_up()
+        self.aim_sent = True
+        self.finish(WorkerResult(True))
+
     def finish(self, result: WorkerResult) -> None:
         if self.completed:
             return
         if self.request.kind is WorkerKind.PREPARATION and self.cancel_requested:
             self.harness.backend.reload_up()
+        if self.request.kind is WorkerKind.AIM_OFF and self.cancel_requested:
+            self.harness.backend.aim_up()
         self.completed = True
         self.alive = False
         self.harness.put_worker_event(ControlEventKind.WORKER_STOPPED, self, result)
@@ -258,8 +375,13 @@ class FakeSessionWorker:
     def cancel_and_release(self) -> BaseException | None:
         self.cancel()
         try:
-            if self.request.kind is WorkerKind.PREPARATION:
+            if self.request.kind in (
+                WorkerKind.PREPARATION,
+                WorkerKind.RELOAD_ONLY,
+            ):
                 self.harness.backend.reload_up()
+            elif self.request.kind is WorkerKind.AIM_OFF:
+                self.harness.backend.aim_up()
             elif self.request.kind is WorkerKind.BYPASS:
                 self.harness.backend.mouse_up()
             else:
@@ -269,6 +391,28 @@ class FakeSessionWorker:
         if self.harness.auto_complete_cancel:
             self.finish(WorkerResult(False, canceled=True))
         return None
+
+    def cancel_aim_and_observe(
+        self,
+    ) -> tuple[bool, bool, BaseException | None]:
+        self.cancel()
+        try:
+            self.harness.backend.aim_up()
+        except BaseException as exc:
+            return self.aim_started, self.aim_sent, exc
+        if self.harness.auto_complete_cancel:
+            self.finish(WorkerResult(False, canceled=True))
+        return self.aim_started, self.aim_sent, None
+
+    def reload_in_progress(self) -> bool:
+        return self.reload_started and not self.reload_completed
+
+    def sprint_stop(self) -> bool:
+        if self.reload_in_progress():
+            self.finish_after_reload_requested = True
+            return True
+        self.cancel_and_release()
+        return False
 
     def join(self, timeout: float | None = None) -> None:
         self.alive = False
@@ -285,6 +429,7 @@ class SimulationHarness:
         trace: bool = True,
         auto_complete_preparation: bool = True,
         auto_complete_cancel: bool = True,
+        auto_complete_aim_off: bool = True,
     ) -> None:
         self.config = replace(
             config,
@@ -292,6 +437,7 @@ class SimulationHarness:
         )
         self.auto_complete_preparation = auto_complete_preparation
         self.auto_complete_cancel = auto_complete_cancel
+        self.auto_complete_aim_off = auto_complete_aim_off
         self.foreground = FakeForeground()
         self.clock = FakeClock()
         self.audio = FakeAudioNotifier()
@@ -655,33 +801,7 @@ def _scenario_k(config: AppConfig) -> str:
         h.machine.generation,
         tuple(h.audio.events),
     )
-    h.click()
-    firing_after_preparation_cancel = (
-        h.machine.state,
-        h.machine.generation,
-        tuple(h.audio.events),
-    )
-    h.key_press(VK_LSHIFT, repeats=2)
-    assert firing_after_preparation_cancel == (
-        h.machine.state,
-        h.machine.generation,
-        tuple(h.audio.events),
-    )
-    for mode in (WeaponMode.PRIMARY, WeaponMode.SECONDARY):
-        firing = SimulationHarness(config)
-        firing.start(mode)
-        snapshot = (
-            firing.machine.state,
-            firing.machine.generation,
-            tuple(firing.audio.events),
-        )
-        firing.key_press(VK_LSHIFT, repeats=2)
-        assert snapshot == (
-            firing.machine.state,
-            firing.machine.generation,
-            tuple(firing.audio.events),
-        )
-    return "Shift was isolated during preparation and immediate firing"
+    return "Shift passed through without disturbing disabled preparation"
 
 
 def _scenario_l(config: AppConfig) -> str:
@@ -933,17 +1053,23 @@ def _scenario_t(config: AppConfig) -> str:
     ups = [at for name, at in cycle_events if name == "MB1_UP"]
     assert len(downs) == len(ups) == 45
     assert [up - down for down, up in zip(downs, ups)] == [35] * 45
-    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [120] * 44
-    assert [next_down - up for up, next_down in zip(ups, downs[1:])] == [85] * 44
-    assert cycle_events[-2:] == [("R_DOWN", 5400), ("R_UP", 5425)]
-    assert cycle_events[-2][1] - ups[-1] == 85
-    assert round(h.clock() * 1000) - started_at == 8025
+    period = config.primary.shot_period_ms
+    release = period - config.primary.fire_press_ms
+    final_down = (config.primary.shots_per_cycle - 1) * period
+    final_up = final_down + config.primary.fire_press_ms
+    reload_up = final_up + config.primary.reload_press_ms
+    duration = reload_up + config.primary.reload_wait_ms
+    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [period] * 44
+    assert [next_down - up for up, next_down in zip(ups, downs[1:])] == [release] * 44
+    assert cycle_events[-2:] == [("R_DOWN", final_up), ("R_UP", reload_up)]
+    assert cycle_events[-2][1] - ups[-1] == 0
+    assert round(h.clock() * 1000) - started_at == duration
     assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.FULL
     assert h.machine.enabled and h.audio.events == ["ON"]
 
     macro.begin_next_cycle()
     h.drain()
-    assert h.backend.timed_events[-1] == ("MB1_DOWN", started_at + 8025)
+    assert h.backend.timed_events[-1] == ("MB1_DOWN", started_at + duration)
     assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
     assert h.audio.events == ["ON"]
     return "PRIMARY completed 45 tactical clicks, reloaded FULL, and repeated"
@@ -951,12 +1077,12 @@ def _scenario_t(config: AppConfig) -> str:
 
 def _run_primary_cancellation(
     config: AppConfig, cancel_at_ms: int
-) -> tuple[FakeGeneratedInput, WorkerResult, tuple[WorkerProgress, ...]]:
+) -> tuple[FakeGeneratedInput, WorkerResult, tuple[WorkerProgressUpdate, ...]]:
     clock = FakeClock()
     started_at = clock()
     backend = FakeGeneratedInput(lambda: "RUNNING_PRIMARY", clock)
     cancel = threading.Event()
-    progress: list[WorkerProgress] = []
+    progress: list[WorkerProgressUpdate] = []
 
     def wait(event: threading.Event, seconds: float) -> bool:
         result = clock.wait(event, seconds)
@@ -981,13 +1107,18 @@ def _run_primary_cancellation(
 
 
 def _scenario_u(config: AppConfig) -> str:
+    period = config.primary.shot_period_ms
+    press = config.primary.fire_press_ms
+    final_down = (config.primary.shots_per_cycle - 1) * period
+    reload_down = final_down + press
+    reload_up = reload_down + config.primary.reload_press_ms
     cases = (
         ("shot 1 down", 5, 1, False),
-        ("shot 20 up interval", 2320, 20, False),
-        ("after shot 44", 5275, 44, False),
-        ("final post-shot interval", 5350, 45, False),
-        ("R-down", 5405, 45, True),
-        ("reload wait", 5430, 45, True),
+        ("shot 20 up interval", 19 * period + press + 5, 20, False),
+        ("after shot 44", 43 * period + press + 5, 44, False),
+        ("final shot down", final_down + 5, 45, False),
+        ("R-down", reload_down + 5, 45, True),
+        ("reload wait", reload_up + 5, 45, True),
     )
     for label, cancel_at, expected_shots, expect_reload in cases:
         backend, result, progress = _run_primary_cancellation(config, cancel_at)
@@ -997,7 +1128,9 @@ def _scenario_u(config: AppConfig) -> str:
         assert names.count("MB1_UP") == expected_shots, label
         assert ("R_DOWN" in names) is expect_reload, label
         assert ("R_UP" in names) is expect_reload, label
-        assert WorkerProgress.RELOAD_COMPLETE not in progress, label
+        assert WorkerProgress.RELOAD_COMPLETED not in (
+            update.phase for update in progress
+        ), label
         assert not backend.mouse_owned and not backend.reload_owned, label
     return "PRIMARY cancellation cleaned input at six firing/reload positions"
 
@@ -1009,10 +1142,10 @@ def _scenario_v(config: AppConfig) -> str:
     cancel = threading.Event()
     progress: list[tuple[WorkerProgress, int]] = []
 
-    def report(update: WorkerProgress) -> None:
-        elapsed = round((clock() - started_at) * 1000)
-        progress.append((update, elapsed))
-        if update is WorkerProgress.RELOAD_COMPLETE:
+    def report(update: WorkerProgressUpdate) -> None:
+        elapsed = round((update.occurred_at - started_at) * 1000)
+        progress.append((update.phase, elapsed))
+        if update.phase is WorkerProgress.RELOAD_COMPLETED:
             cancel.set()
 
     result = MacroEngine(
@@ -1029,13 +1162,290 @@ def _scenario_v(config: AppConfig) -> str:
     ]
     downs = [at for name, at in times if name == "MB1_DOWN"]
     ups = [at for name, at in times if name == "MB1_UP"]
+    period = config.secondary.shot_period_ms
+    press = config.secondary.fire_press_ms
+    release = period - press
+    final_down = (config.secondary.shots_per_cycle - 1) * period
+    final_up = final_down + press
+    reload_up = final_up + config.secondary.reload_press_ms
+    duration = reload_up + config.secondary.reload_wait_ms
     assert result.canceled
     assert names == ["MB1_DOWN", "MB1_UP"] * 13 + ["R_DOWN", "R_UP"]
-    assert [up - down for down, up in zip(downs, ups)] == [35] * 13
-    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [180] * 12
-    assert times[-2:] == [("R_DOWN", 2340), ("R_UP", 2365)]
-    assert progress[-1] == (WorkerProgress.RELOAD_COMPLETE, 4365)
-    return "SECONDARY retained its exact 13-shot 4,365 ms cycle"
+    assert [up - down for down, up in zip(downs, ups)] == [press] * 13
+    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [period] * 12
+    assert [next_down - up for up, next_down in zip(ups, downs[1:])] == [release] * 12
+    assert times[-2:] == [("R_DOWN", final_up), ("R_UP", reload_up)]
+    assert times[-2][1] == ups[-1]
+    assert progress[-1] == (WorkerProgress.RELOAD_COMPLETE, duration)
+    return "SECONDARY final MB1-up and R-down were consecutive at 1,475 ms"
+
+
+def _scenario_w(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=True)
+    started_at = round(h.clock() * 1000)
+    assert h.click() == (True, True)
+    macro = h.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    macro.complete_cycle_reload()
+    h.drain()
+    relative = [(name, at - started_at) for name, at in h.backend.timed_events]
+    downs = [at for name, at in relative if name == "MB1_DOWN"]
+    ups = [at for name, at in relative if name == "MB1_UP"]
+    assert len(downs) == len(ups) == 45
+    final_down = (
+        (config.primary.shots_per_cycle - 1)
+        * config.primary.shot_period_ms
+    )
+    final_up = final_down + config.primary.fire_press_ms
+    reload_up = final_up + config.primary.reload_press_ms
+    duration = reload_up + config.primary.reload_wait_ms
+    assert downs[-1] == final_down and ups[-1] == final_up
+    assert relative[-2:] == [("R_DOWN", final_up), ("R_UP", reload_up)]
+    assert round(h.clock() * 1000) - started_at == duration
+    trace_records = [
+        record for record in h.reports if record.startswith("TRACE:")
+    ]
+    trace = {
+        record.split("event=", 1)[1].split(" ", 1)[0]: float(
+            record.split("elapsed_ms=", 1)[1].split(" ", 1)[0]
+        )
+        for record in trace_records
+    }
+    assert trace["FINAL_SHOT_DOWN"] == float(final_down)
+    assert trace["FINAL_SHOT_UP"] == float(final_up)
+    assert trace["RELOAD_KEY_DOWN"] == float(final_up)
+    assert trace["RELOAD_KEY_UP"] == float(reload_up)
+    assert trace["RELOAD_WAIT_STARTED"] == float(reload_up)
+    assert trace["RELOAD_COMPLETED"] == float(duration)
+    for event_name in (
+        "FINAL_SHOT_DOWN",
+        "FINAL_SHOT_UP",
+        "RELOAD_KEY_DOWN",
+        "RELOAD_KEY_UP",
+        "RELOAD_WAIT_STARTED",
+        "RELOAD_COMPLETED",
+    ):
+        record = next(
+            item for item in trace_records if f"event={event_name} " in item
+        )
+        assert "source=worker" in record
+        assert "weapon=PRIMARY" in record
+        assert "enabled=true" in record
+        assert f"worker_phase={event_name}" in record
+        assert "generation=" in record and "reason=" in record
+    return f"PRIMARY timing remained unchanged at {duration:,} ms"
+
+
+def _scenario_x(config: AppConfig) -> str:
+    for mode, shift_vk in (
+        (WeaponMode.PRIMARY, VK_LSHIFT),
+        (WeaponMode.SECONDARY, VK_RSHIFT),
+    ):
+        h = SimulationHarness(config, trace=True)
+        h.start(mode)
+        before = len(h.backend.events)
+        assert all(result is False for result in h.key_press(shift_vk, repeats=2))
+        emitted = [name for name, _state in h.backend.events[before:]]
+        assert emitted == ["MB1_UP", "R_DOWN", "R_UP"]
+        assert not h.machine.enabled and not h.machine.firing
+        assert h.machine.worker is None
+        assert h.machine.magazine_state(mode) is MagazineState.FULL
+        assert h.audio.events == ["ON", "OFF"]
+        assert sum(
+            worker.request.kind is WorkerKind.RELOAD_ONLY
+            for worker in h.workers
+        ) == 1
+        disabled = [
+            report
+            for report in h.reports
+            if "event=MACRO_DISABLED" in report and "reason=SHIFT_SPRINT" in report
+        ]
+        assert len(disabled) == 1
+    return "left/right Shift stopped both modes and completed one sprint reload"
+
+
+def _scenario_y(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=True)
+    h.start(WeaponMode.PRIMARY)
+    macro = h.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    macro.begin_macro_reload()
+    h.drain()
+    reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+    h.key_press(VK_LSHIFT, repeats=2)
+    assert not h.machine.enabled and h.audio.events == ["ON", "OFF"]
+    assert h.machine.worker is macro and macro.finish_after_reload_requested
+    macro.complete_macro_reload()
+    h.drain()
+    assert sum(name == "R_DOWN" for name, _state in h.backend.events) == reloads
+    assert h.machine.worker is None and not h.machine.enabled
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.FULL
+    assert not any(
+        worker.request.kind is WorkerKind.RELOAD_ONLY for worker in h.workers
+    )
+    return "Shift preserved one active reload and stopped before the next cycle"
+
+
+def _scenario_z(config: AppConfig) -> str:
+    idle = SimulationHarness(config)
+    idle_before = (
+        idle.machine.state,
+        idle.machine.generation,
+        len(idle.workers),
+        tuple(idle.audio.events),
+    )
+    idle.key_press(VK_LSHIFT, repeats=3)
+    assert idle_before == (
+        idle.machine.state,
+        idle.machine.generation,
+        len(idle.workers),
+        tuple(idle.audio.events),
+    )
+
+    prep = SimulationHarness(config, auto_complete_preparation=False)
+    prep.key_press(VK_2)
+    worker = prep.machine.worker
+    before = (prep.machine.generation, tuple(prep.audio.events))
+    prep.key_press(VK_RSHIFT, repeats=3)
+    assert prep.machine.worker is worker
+    assert before == (prep.machine.generation, tuple(prep.audio.events))
+    assert isinstance(worker, FakeSessionWorker) and not worker.cancel_requested
+    worker.finish_preparation()
+    prep.drain()
+    assert prep.machine.magazine_state(WeaponMode.SECONDARY) is MagazineState.FULL
+    return "Shift was pass-through-only while disabled idle or preparing"
+
+
+def _mb2_snapshot(h: SimulationHarness) -> tuple[object, ...]:
+    return (
+        h.machine.state,
+        h.machine.generation,
+        h.machine.magazine_state(h.machine.selected_mode),
+        h.machine.worker,
+        tuple(h.audio.events),
+        len(h.backend.events),
+    )
+
+
+def _toggle_aim_twice(h: SimulationHarness) -> None:
+    before = _mb2_snapshot(h)
+    for _ in range(2):
+        assert not h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        assert not h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+    assert _mb2_snapshot(h) == before
+
+
+def _scenario_aa(config: AppConfig) -> str:
+    for mode in WeaponMode:
+        firing = SimulationHarness(config)
+        firing.start(mode)
+        _toggle_aim_twice(firing)
+
+    preparation = SimulationHarness(config, auto_complete_preparation=False)
+    preparation.key_press(VK_2)
+    _toggle_aim_twice(preparation)
+    prep_worker = preparation.machine.worker
+    assert isinstance(prep_worker, FakeSessionWorker)
+    prep_worker.begin_reload()
+    _toggle_aim_twice(preparation)
+
+    sprint = SimulationHarness(config)
+    sprint.start(WeaponMode.PRIMARY)
+    sprint.auto_complete_preparation = False
+    sprint.key_press(VK_LSHIFT)
+    assert sprint.machine.worker is not None
+    assert sprint.machine.worker.request.kind is WorkerKind.RELOAD_ONLY
+    _toggle_aim_twice(sprint)
+
+    idle = SimulationHarness(config)
+    _toggle_aim_twice(idle)
+    return "physical MB2 toggled assumed aim with zero macro-state effect"
+
+
+def _scenario_ab(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=True)
+    assert not h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert not h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    assert h.machine.aim_state is AimState.AIM_ON
+    generation = h.machine.generation
+    assert all(result is False for result in h.key_press(VK_LSHIFT, repeats=3))
+    assert h.machine.aim_state is AimState.AIM_OFF
+    assert h.machine.generation == generation
+    assert [name for name, _state in h.backend.events] == [
+        "MB2_DOWN",
+        "MB2_UP",
+    ]
+    assert all(
+        source is EventSource.INJECTED_OWNED
+        for _name, source in h.backend.tagged_events
+    )
+    assert h.audio.events == []
+    sent = len(h.backend.events)
+    h.key_press(VK_RSHIFT, repeats=2)
+    assert len(h.backend.events) == sent
+    return "Shift conditionally sent one tagged aim-off pair only from AIM_ON"
+
+
+def _scenario_ac(config: AppConfig) -> str:
+    pending = SimulationHarness(
+        config,
+        auto_complete_cancel=False,
+        auto_complete_aim_off=False,
+    )
+    pending.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    pending.policy.mouse(WM_RBUTTONUP, 0, 0)
+    pending.drain()
+    pending.key_press(VK_LSHIFT)
+    aim_worker = next(
+        worker
+        for worker in pending.workers
+        if worker.request.kind is WorkerKind.AIM_OFF
+    )
+    pending.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    pending.policy.mouse(WM_RBUTTONUP, 0, 0)
+    pending.drain()
+    assert aim_worker.cancel_requested
+    assert pending.machine.aim_state is AimState.UNKNOWN
+    aim_worker.finish(WorkerResult(True))
+    pending.drain()
+    assert pending.machine.aim_state is AimState.UNKNOWN
+
+    lost = SimulationHarness(
+        config,
+        auto_complete_cancel=False,
+        auto_complete_aim_off=False,
+    )
+    lost.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    lost.policy.mouse(WM_RBUTTONUP, 0, 0)
+    lost.drain()
+    lost.key_press(VK_LSHIFT)
+    lost_worker = next(
+        worker
+        for worker in lost.workers
+        if worker.request.kind is WorkerKind.AIM_OFF
+    )
+    lost_worker.begin_aim_off()
+    lost.foreground_loss()
+    assert not lost.backend.aim_owned
+    assert lost.machine.aim_state is AimState.UNKNOWN
+
+    native_config = replace(
+        config,
+        controls=replace(
+            config.controls,
+            shift_cancels_aim_natively=True,
+        ),
+    )
+    native = SimulationHarness(native_config)
+    native.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    native.policy.mouse(WM_RBUTTONUP, 0, 0)
+    native.drain()
+    native.key_press(VK_LSHIFT, repeats=2)
+    assert native.machine.aim_state is AimState.AIM_OFF
+    assert native.backend.events == []
+    return "pending aim-off invalidation and native Shift mode remained safe"
 
 
 _SCENARIOS = (
@@ -1061,6 +1471,13 @@ _SCENARIOS = (
     ("T", _scenario_t),
     ("U", _scenario_u),
     ("V", _scenario_v),
+    ("W", _scenario_w),
+    ("X", _scenario_x),
+    ("Y", _scenario_y),
+    ("Z", _scenario_z),
+    ("AA", _scenario_aa),
+    ("AB", _scenario_ab),
+    ("AC", _scenario_ac),
 )
 
 
@@ -1075,8 +1492,6 @@ def run_simulated_session(config: AppConfig) -> int:
         prohibited = (
             "Preparation failed for PRIMARY: RIGHT_DOWN",
             "Preparation failed for SECONDARY: RIGHT_DOWN",
-            "Preparation failed for PRIMARY: SHIFT_DOWN",
-            "Preparation failed for SECONDARY: SHIFT_DOWN",
             "START_REJECTED: MB1-up",
         )
         joined = "\n".join(lines)

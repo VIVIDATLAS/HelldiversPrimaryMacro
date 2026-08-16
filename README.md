@@ -20,7 +20,7 @@ project does not provide a bypass or elevated-mode workaround.
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
 6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through V with fake hooks, input, foreground, time, workers,
+   scenarios A through AC with fake hooks, input, foreground, time, workers,
    and audio only.
 7. Review both dry runs before deliberately choosing `--live`.
 
@@ -38,31 +38,22 @@ The initial primary configuration is:
 ```toml
 [primary]
 shots_per_cycle = 45
-shot_period_ms = 120
+shot_period_ms = 85
 fire_press_ms = 35
 reload_press_ms = 25
-reload_wait_ms = 2600
+reload_wait_ms = 2000
 ```
 
 `shot_period_ms` is authoritative. The MB1-up interval is derived as
 `shot_period_ms - fire_press_ms`, so the configured values produce 35 ms down
-and 85 ms up, exactly 120 ms from one generated MB1-down to the next. The AR-2
-Coyote's rated 600 RPM corresponds to `60000 / 600 = 100` ms per shot. The
-approved initial period gives `60000 / 120 = 500` RPM, providing a 20 ms margin
-above the theoretical minimum period. Lowering `primary.shot_period_ms`
-increases the firing speed.
+and a 50 ms release interval between consecutive shots. Timing remains entirely
+configuration-driven; this correction does not change PRIMARY behavior.
 
 For later calibration, change only `primary.shot_period_ms` in `config.toml`,
 then run configuration validation and the primary dry run. Do not change the
 shot count, click-down time, or reload timing during firing-rate calibration.
-These rates are reference values only; only 120 ms is implemented initially:
-
-| Period | Rate |
-| -----: | ---: |
-| 120 ms | 500 RPM — initial setting |
-| 110 ms | approximately 545 RPM |
-| 105 ms | approximately 571 RPM |
-| 100 ms | 600 RPM — theoretical weapon limit |
+The configured period is an observed operational value, not an inferred weapon
+limit. Do not change it during unrelated control or reload work.
 
 The tactical-reload cycle assumes a maximum loaded state of 46: start at 46,
 fire exactly 45 shots, leave one round chambered, reload, and return to 46. Do
@@ -186,10 +177,46 @@ generation, and cannot enter preparation or restore
 distinct unmodified MB1-down is required. Ctrl alone is state-neutral while
 the macro is disabled. Ctrl+MB1 always marks the selected magazine `UNKNOWN`.
 
-Physical MB2 is completely outside macro logic. It passes down/up unchanged,
-so holding right click to aim while using MB1 does not cancel, reload, mutate a
-generation, or emit audio. Left/Right Shift down, repeat, and up are likewise
-irrelevant to macro state and always pass normally.
+Physical MB2 is the game's toggle-aim input. Every down/up passes through
+unchanged and is never suppressed or replayed. A foreground physical MB2-down
+updates a conservative assumed state from `AIM_OFF` to `AIM_ON`, or from
+`AIM_ON` to `AIM_OFF`; MB2-up is edge cleanup only. This tracking never enables,
+disables, starts, stops, reloads, or emits macro audio. Tagged/generated and
+other injected MB2 events are ignored by the hook.
+
+Physical Left and Right Shift are the game's toggle-sprint inputs and always
+pass through unchanged. Only the first non-injected down edge while held is
+actionable. If the macro is actively firing, Shift disables it, queues exactly
+one OFF notification, releases generated MB1, prevents later shots, and begins
+one reload-only sequence after the firing worker has retired. Reload is allowed
+while sprinting. A valid reload may publish `FULL`, but the macro remains
+disabled and MB1 must be pressed again to resume firing.
+
+If Shift arrives after the active macro has already entered its reload phase,
+the existing `R` press/reload wait is allowed to finish without cancellation or
+a duplicate reload. The worker stops before another firing cycle. Shift while
+disabled and idle or during selection preparation is pass-through-only; it does
+not change generation, start work, cancel preparation, or emit audio. Shift-up
+only clears the physical hook latch and never changes controller state.
+
+The live controller starts with assumed `AIM_OFF`. With the default
+`controls.shift_cancels_aim_natively = false`, the first Shift-down sends one
+owned/tagged MB2 down/up pair only when the assumed state is `AIM_ON`. It first
+moves to `AIM_OFF_PENDING`, then publishes `AIM_OFF` only after successful
+delivery. `AIM_OFF` and `UNKNOWN` never generate MB2, so Shift cannot blindly
+start aiming. Repeats and Shift-up do not send additional clicks. A physical
+MB2 edge or foreground loss invalidates pending output; failure or obsolete
+completion leaves the state `UNKNOWN` and is never retried blindly.
+
+If Helldivers itself cancels toggle aim when Shift begins sprinting, set:
+
+```toml
+[controls]
+shift_cancels_aim_natively = true
+```
+
+In that mode Shift emits no generated MB2 and records the assumed state as
+`AIM_OFF`. If Shift ever causes aiming to turn on, enable this option.
 
 For narrow Ctrl troubleshooting, set
 `diagnostics.ctrl_bypass_logging = true`. It logs only Ctrl cleanup state, MB1
@@ -214,6 +241,16 @@ foreground uncertainty, and ordinary `SendInput` failure. Both diagnostic
 options are disabled by default and never log unrelated user input.
 `SAME_MODE_SELECTION_IGNORED` is the only optional trace record for an
 otherwise inert same-mode selection.
+
+Conditional aim tracing is limited to `AIM_PHYSICAL_ON`, `AIM_PHYSICAL_OFF`,
+`AIM_OFF_REQUESTED`, `AIM_OFF_SENT`, `AIM_OFF_SKIPPED`, and `AIM_OFF_FAILED`.
+
+Reload diagnostics use transition-local worker phases `FINAL_SHOT_DOWN`,
+`FINAL_SHOT_UP`, `RELOAD_KEY_DOWN`, `RELOAD_KEY_UP`,
+`RELOAD_WAIT_STARTED`, `RELOAD_COMPLETED`, and `RELOAD_FAILED`. Each trace has
+the selected weapon, generation, worker source/phase, enabled state, elapsed
+milliseconds, and reason. For both weapon profiles, `FINAL_SHOT_UP` and
+`RELOAD_KEY_DOWN` must carry the same elapsed timestamp.
 
 Confirmed foreground loss is one transaction: disable, invalidate the
 generation, cancel work, release owned input, retain the
@@ -257,24 +294,29 @@ or bypass anti-cheat restrictions.
 
 ## Exact firing cycles
 
-PRIMARY repeats exactly 45 discrete clicks. Each is MB1 down 35 ms, up, then
-wait 85 ms, including after shot 45. Each MB1-down period is 120 ms, so the
-firing phase is `45 * 120 = 5400` ms. It then generates scan-code `R` down
-25 ms, up, waits 2600 ms, and repeats without replaying ON. The complete cycle
-is `5400 + 25 + 2600 = 8025` ms.
+PRIMARY repeats exactly 45 discrete clicks at the configured 85 ms period.
+Shots 1 through 44 are MB1 down 35 ms, up, then wait 50 ms. Shot 45 is MB1 down
+at 3740 ms and up at 3775 ms; scan-code `R` goes down immediately at the same
+3775 ms timestamp under one short output-serialization boundary. There is no
+post-shot wait, controller round trip, worker handoff, or sleeping lock between
+the final MB1-up and R-down. `R` goes up at 3800 ms, the 2000 ms reload wait
+then runs, and valid completion occurs at 5800 ms. ON is not replayed between
+cycles.
 
-SECONDARY repeats exactly 13 shots. Each is MB1 down 35 ms, up, then wait
-145 ms, including after shot 13. Each period is 180 ms. It then generates
-scan-code `R` down 25 ms, up, waits 2000 ms, and repeats. The firing cycle is
-4365 ms.
+SECONDARY repeats exactly 13 shots at the configured 120 ms period. Shots 1
+through 12 are MB1 down 35 ms, up, then wait 85 ms. Shot 13 is down at 1440 ms
+and up at 1475 ms; `R` goes down immediately at the same 1475 ms timestamp
+under the same short output boundary. `R` goes up at 1500 ms, the 2000 ms reload
+wait follows, and the complete cycle is 3500 ms. No timing configuration value
+was reduced to obtain the zero-gap reload.
 
 These dry-cycle durations start immediately after activation; they do not wait
 for selection preparation. Background selection may still add switch-settle
 and reload work if it finishes before activation. Every macro/preparation wait
 checks cancellation and fresh foreground ownership at 5 ms intervals.
 
-The shared output lock is held only around individual output calls and cleanup,
-never during switch-settle, press-duration, or reload waits. Immediate start
+The shared output lock is held only around short consecutive output groups and
+cleanup, never during switch-settle, press-duration, or reload waits. Immediate start
 signals preparation cancellation without acquiring that lock or joining the
 thread. A retired preparation may release only its owned `R`; it cannot release
 the current macro's MB1. State and generated-input ownership are published
@@ -283,8 +325,9 @@ before the firing worker is activated.
 ## Audio
 
 - ON: 1000 Hz for 100 ms, queued once on an accepted immediate enable edge.
-- OFF: 500 Hz for 150 ms, exactly once when an enabled macro is disabled and
-  owned-input cleanup has completed.
+- OFF: 500 Hz for 150 ms, exactly once when an enabled macro is disabled. Shift
+  queues OFF immediately before the allowed sprint reload; other stop paths
+  retain their deterministic cleanup ordering.
 
 Preparation, selection, startup, and idle cancellation are silent. Audio uses a
 dedicated FIFO thread and cannot delay hook callbacks, input release, or timing.
@@ -309,12 +352,13 @@ Only `--live` installs hooks, suppresses paired physical MB1, or generates
 input. `--test-audio` plays only the configured tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through V and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+A through AC and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
 the existing controller regressions plus immediate UNKNOWN start, switch-settle
 preemption, active-reload preemption, immediate stop, and first-cycle reload
-synchronization all pass. Scenarios T, U, and V respectively verify the exact
-45-shot tactical cycle, six primary cancellation positions, and the unchanged
-13-shot/4,365 ms secondary cycle.
+synchronization all pass. Scenario V verifies zero-gap SECONDARY reload;
+scenarios W through AA preserve PRIMARY, sprint-reload, and physical toggle-aim
+coverage; scenarios AB and AC verify conditional aim-off delivery, stale
+invalidation, foreground cleanup, and native Shift mode.
 
 The complete non-live validation set is:
 
@@ -341,3 +385,15 @@ loop failure cancels work. UIPI or the game may reject `SendInput`. If ordinary
 input is rejected, stop using live mode; no bypass is implemented. Python can
 schedule promptly but cannot force Helldivers to accept or immediately act on
 input during a weapon-switch/reload animation.
+
+The application cannot observe game animation state or whether the game accepts
+an ordinary generated `R`. If diagnostics prove final MB1-up and R-down share a
+timestamp but the game still displays inactivity, that remaining gap is
+game-side animation/input acceptance rather than an application sleep. The
+application does not send blind reload retries.
+
+Aim state is inferred only from foreground physical MB2 edges and successful
+owned output. Game-side aim changes, missed events, focus changes, UI actions,
+or rejected input can desynchronize that assumption. Foreground loss and
+ambiguous pending-output races therefore set it to `UNKNOWN`; Shift never sends
+a blind MB2 toggle from `UNKNOWN`.

@@ -12,6 +12,7 @@ from .models import (
     WeaponMode,
     WorkerKind,
     WorkerProgress,
+    WorkerProgressUpdate,
     WorkerRequest,
     WorkerResult,
 )
@@ -24,6 +25,8 @@ class ForegroundLost(RuntimeError):
 class GeneratedInput(Protocol):
     def mouse_down(self) -> None: ...
     def mouse_up(self) -> None: ...
+    def aim_down(self) -> None: ...
+    def aim_up(self) -> None: ...
     def reload_down(self) -> None: ...
     def reload_up(self) -> None: ...
     def release_all(self) -> None: ...
@@ -33,15 +36,16 @@ def primary_cycle_steps(config: AppConfig) -> list[CycleStep]:
     steps: list[CycleStep] = []
     primary = config.primary
     between_ms = primary.shot_period_ms - primary.fire_press_ms
-    for _ in range(primary.shots_per_cycle):
+    for shot in range(primary.shots_per_cycle):
         steps.extend(
             [
                 CycleStep(OutputAction.MB1_DOWN),
                 CycleStep(OutputAction.WAIT, primary.fire_press_ms),
                 CycleStep(OutputAction.MB1_UP),
-                CycleStep(OutputAction.WAIT, between_ms),
             ]
         )
+        if shot < primary.shots_per_cycle - 1:
+            steps.append(CycleStep(OutputAction.WAIT, between_ms))
     steps.extend(
         [
             CycleStep(OutputAction.R_DOWN),
@@ -57,15 +61,16 @@ def secondary_cycle_steps(config: AppConfig) -> list[CycleStep]:
     steps: list[CycleStep] = []
     secondary = config.secondary
     between_ms = secondary.shot_period_ms - secondary.fire_press_ms
-    for _ in range(secondary.shots_per_cycle):
+    for shot in range(secondary.shots_per_cycle):
         steps.extend(
             [
                 CycleStep(OutputAction.MB1_DOWN),
                 CycleStep(OutputAction.WAIT, secondary.fire_press_ms),
                 CycleStep(OutputAction.MB1_UP),
-                CycleStep(OutputAction.WAIT, between_ms),
             ]
         )
+        if shot < secondary.shots_per_cycle - 1:
+            steps.append(CycleStep(OutputAction.WAIT, between_ms))
     steps.extend(
         [
             CycleStep(OutputAction.R_DOWN),
@@ -118,24 +123,35 @@ class MacroEngine:
                 return
             self._wait(cancel_event, min(self._poll_seconds, remaining))
 
+    def _perform_outputs(
+        self,
+        actions: list[OutputAction],
+        cancel_event: threading.Event,
+        shutdown_event: threading.Event,
+        reload_started: Callable[[], None] = lambda: None,
+    ) -> None:
+        with self.io_lock:
+            self._check_active(cancel_event, shutdown_event)
+            for action in actions:
+                if action is OutputAction.MB1_DOWN:
+                    self.backend.mouse_down()
+                elif action is OutputAction.MB1_UP:
+                    self.backend.mouse_up()
+                elif action is OutputAction.R_DOWN:
+                    self.backend.reload_down()
+                    reload_started()
+                elif action is OutputAction.R_UP:
+                    self.backend.reload_up()
+                else:
+                    raise AssertionError(f"unexpected output action: {action}")
+
     def _perform_output(
         self,
         action: OutputAction,
         cancel_event: threading.Event,
         shutdown_event: threading.Event,
     ) -> None:
-        with self.io_lock:
-            self._check_active(cancel_event, shutdown_event)
-            if action is OutputAction.MB1_DOWN:
-                self.backend.mouse_down()
-            elif action is OutputAction.MB1_UP:
-                self.backend.mouse_up()
-            elif action is OutputAction.R_DOWN:
-                self.backend.reload_down()
-            elif action is OutputAction.R_UP:
-                self.backend.reload_up()
-            else:
-                raise AssertionError(f"unexpected output action: {action}")
+        self._perform_outputs([action], cancel_event, shutdown_event)
 
     def _finish_result(
         self,
@@ -161,38 +177,116 @@ class MacroEngine:
         mode: WeaponMode,
         cancel_event: threading.Event,
         shutdown_event: threading.Event,
-        progress: Callable[[WorkerProgress], None] = lambda _progress: None,
+        progress: Callable[[WorkerProgressUpdate], None] = lambda _progress: None,
+        finish_after_reload: threading.Event | None = None,
+        reload_started: Callable[[], None] = lambda: None,
     ) -> WorkerResult:
         error: BaseException | None = None
         canceled = False
+        success = False
+        reload_phase_started = False
+        reload_completed = False
+        finish_after_reload = finish_after_reload or threading.Event()
         steps = (
             primary_cycle_steps(self._config)
             if mode is WeaponMode.PRIMARY
             else secondary_cycle_steps(self._config)
         )
+        total_shots = (
+            self._config.primary.shots_per_cycle
+            if mode is WeaponMode.PRIMARY
+            else self._config.secondary.shots_per_cycle
+        )
+        shot_count = 0
+
+        def report(phase: WorkerProgress, reason: str) -> None:
+            progress(WorkerProgressUpdate(phase, self._clock(), reason))
+
         try:
-            while True:
-                for index, step in enumerate(steps):
+            while not success:
+                shot_count = 0
+                reload_phase_started = False
+                reload_completed = False
+                index = 0
+                while index < len(steps):
+                    step = steps[index]
                     if step.action is OutputAction.WAIT:
                         self._cancelable_wait(
                             step.duration_ms, cancel_event, shutdown_event
                         )
-                    else:
-                        self._perform_output(step.action, cancel_event, shutdown_event)
-                        if step.action is OutputAction.MB1_DOWN:
-                            progress(WorkerProgress.SHOT_BEGAN)
-                    if index == len(steps) - 1:
-                        # The final step is the complete reload wait. It can be
-                        # reported only after every foreground/cancel check passed.
-                        progress(WorkerProgress.RELOAD_COMPLETE)
-        except InterruptedError:
+                        if index == len(steps) - 1:
+                            reload_completed = True
+                            report(
+                                WorkerProgress.RELOAD_COMPLETED,
+                                "configured reload wait completed",
+                            )
+                            if finish_after_reload.is_set():
+                                success = True
+                        index += 1
+                        continue
+
+                    actions: list[OutputAction] = []
+                    while (
+                        index < len(steps)
+                        and steps[index].action is not OutputAction.WAIT
+                    ):
+                        actions.append(steps[index].action)
+                        index += 1
+                    # Consecutive output actions share one short I/O boundary.
+                    # Each profile's final MB1-up and R-down therefore have no wait,
+                    # controller queue operation, or lock release between them.
+                    self._perform_outputs(
+                        actions,
+                        cancel_event,
+                        shutdown_event,
+                        reload_started,
+                    )
+                    for action in actions:
+                        if action is OutputAction.MB1_DOWN:
+                            shot_count += 1
+                            report(
+                                WorkerProgress.SHOT_BEGAN,
+                                "generated shot began",
+                            )
+                            if shot_count == total_shots:
+                                report(
+                                    WorkerProgress.FINAL_SHOT_DOWN,
+                                    "final configured shot pressed",
+                                )
+                        elif action is OutputAction.MB1_UP and shot_count == total_shots:
+                            report(
+                                WorkerProgress.FINAL_SHOT_UP,
+                                "final configured shot released",
+                            )
+                        elif action is OutputAction.R_DOWN:
+                            reload_phase_started = True
+                            report(
+                                WorkerProgress.RELOAD_KEY_DOWN,
+                                "reload key pressed after firing phase",
+                            )
+                        elif action is OutputAction.R_UP:
+                            report(
+                                WorkerProgress.RELOAD_KEY_UP,
+                                "configured reload key press completed",
+                            )
+                            report(
+                                WorkerProgress.RELOAD_WAIT_STARTED,
+                                "reload wait began after R-up",
+                            )
+        except InterruptedError as exc:
             canceled = True
+            if reload_phase_started and not reload_completed:
+                report(WorkerProgress.RELOAD_FAILED, str(exc))
         except (ForegroundLost, InputApiError) as exc:
             error = exc
+            if reload_phase_started and not reload_completed:
+                report(WorkerProgress.RELOAD_FAILED, str(exc))
         except BaseException as exc:  # Worker boundary; cleanup still has priority.
             error = exc
+            if reload_phase_started and not reload_completed:
+                report(WorkerProgress.RELOAD_FAILED, str(exc))
         return self._finish_result(
-            success=False,
+            success=success,
             canceled=canceled,
             error=error,
             release_owned=self.backend.release_all,
@@ -204,24 +298,88 @@ class MacroEngine:
         switch_settle_ms: int,
         cancel_event: threading.Event,
         shutdown_event: threading.Event,
+        progress: Callable[[WorkerProgressUpdate], None] = lambda _progress: None,
     ) -> WorkerResult:
         error: BaseException | None = None
         canceled = False
         success = False
+        reload_phase_started = False
+        reload_completed = False
         weapon = self._config.primary if mode is WeaponMode.PRIMARY else self._config.secondary
+
+        def report(phase: WorkerProgress, reason: str) -> None:
+            progress(WorkerProgressUpdate(phase, self._clock(), reason))
+
         try:
             if switch_settle_ms:
                 self._cancelable_wait(
                     switch_settle_ms, cancel_event, shutdown_event
                 )
             self._perform_output(OutputAction.R_DOWN, cancel_event, shutdown_event)
+            reload_phase_started = True
+            report(WorkerProgress.RELOAD_KEY_DOWN, "reload-only R-down issued")
             self._cancelable_wait(
                 weapon.reload_press_ms, cancel_event, shutdown_event
             )
             self._perform_output(OutputAction.R_UP, cancel_event, shutdown_event)
+            report(
+                WorkerProgress.RELOAD_KEY_UP,
+                "configured reload key press completed",
+            )
+            report(
+                WorkerProgress.RELOAD_WAIT_STARTED,
+                "reload wait began after R-up",
+            )
             self._cancelable_wait(
                 weapon.reload_wait_ms, cancel_event, shutdown_event
             )
+            reload_completed = True
+            report(
+                WorkerProgress.RELOAD_COMPLETED,
+                "configured reload wait completed",
+            )
+            success = True
+        except InterruptedError as exc:
+            canceled = True
+            if reload_phase_started and not reload_completed:
+                report(WorkerProgress.RELOAD_FAILED, str(exc))
+        except (ForegroundLost, InputApiError) as exc:
+            error = exc
+            if reload_phase_started and not reload_completed:
+                report(WorkerProgress.RELOAD_FAILED, str(exc))
+        except BaseException as exc:
+            error = exc
+            if reload_phase_started and not reload_completed:
+                report(WorkerProgress.RELOAD_FAILED, str(exc))
+        return self._finish_result(
+            success=success,
+            canceled=canceled,
+            error=error,
+            # A retired preparation may overlap a newly started macro. It may
+            # release only the R key it could own, never the new macro's MB1.
+            release_owned=self.backend.reload_up,
+        )
+
+    def send_aim_off(
+        self,
+        cancel_event: threading.Event,
+        shutdown_event: threading.Event,
+        aim_started: Callable[[], None] = lambda: None,
+        aim_sent: Callable[[], None] = lambda: None,
+    ) -> WorkerResult:
+        error: BaseException | None = None
+        canceled = False
+        success = False
+        try:
+            # The owned MB2 pair has no timing wait. Keeping both events under
+            # one short output boundary prevents cancellation from stranding
+            # MB2 down while still allowing the hook thread to return freely.
+            with self.io_lock:
+                self._check_active(cancel_event, shutdown_event)
+                self.backend.aim_down()
+                aim_started()
+                self.backend.aim_up()
+                aim_sent()
             success = True
         except InterruptedError:
             canceled = True
@@ -233,9 +391,7 @@ class MacroEngine:
             success=success,
             canceled=canceled,
             error=error,
-            # A retired preparation may overlap a newly started macro. It may
-            # release only the R key it could own, never the new macro's MB1.
-            release_owned=self.backend.reload_up,
+            release_owned=self.backend.aim_up,
         )
 
     def forward_bypass(
@@ -290,7 +446,7 @@ class MacroWorker:
         engine: MacroEngine,
         shutdown_event: threading.Event,
         on_complete: Callable[[int, WorkerResult], None],
-        on_progress: Callable[[int, WorkerProgress], None],
+        on_progress: Callable[[int, WorkerProgressUpdate], None],
     ) -> None:
         self.token = token
         self.request = request
@@ -300,6 +456,11 @@ class MacroWorker:
         self._on_complete = on_complete
         self._on_progress = on_progress
         self.cancel_event = threading.Event()
+        self._finish_after_reload = threading.Event()
+        self._reload_started = threading.Event()
+        self._reload_completed = threading.Event()
+        self._aim_started = threading.Event()
+        self._aim_sent = threading.Event()
         self._activation = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -322,13 +483,45 @@ class MacroWorker:
         self.cancel()
         try:
             with self._engine.io_lock:
-                if self.request.kind is WorkerKind.PREPARATION:
+                if self.request.kind in (
+                    WorkerKind.PREPARATION,
+                    WorkerKind.RELOAD_ONLY,
+                ):
                     self._engine.backend.reload_up()
+                elif self.request.kind is WorkerKind.AIM_OFF:
+                    self._engine.backend.aim_up()
                 else:
                     self._engine.backend.release_all()
         except BaseException as exc:
             return exc
         return None
+
+    def reload_in_progress(self) -> bool:
+        return self._reload_started.is_set() and not self._reload_completed.is_set()
+
+    def sprint_stop(self) -> bool:
+        """Atomically preserve an active reload or cancel firing and release input."""
+        with self._engine.io_lock:
+            if self.reload_in_progress():
+                self._finish_after_reload.set()
+                return True
+            self.cancel()
+            self._engine.backend.release_all()
+            return False
+
+    def cancel_aim_and_observe(
+        self,
+    ) -> tuple[bool, bool, BaseException | None]:
+        """Cancel a pending aim action and atomically observe delivered edges."""
+        self.cancel()
+        try:
+            with self._engine.io_lock:
+                started = self._aim_started.is_set()
+                sent = self._aim_sent.is_set()
+                self._engine.backend.aim_up()
+        except BaseException as exc:
+            return self._aim_started.is_set(), self._aim_sent.is_set(), exc
+        return started, sent, None
 
     def join(self, timeout: float | None = None) -> None:
         self._thread.join(timeout)
@@ -344,18 +537,43 @@ class MacroWorker:
             )
             return
         if self.request.kind is WorkerKind.MACRO:
+            def macro_progress(update: WorkerProgressUpdate) -> None:
+                if update.phase is WorkerProgress.SHOT_BEGAN:
+                    # A repeating macro owns fresh reload-phase latches for
+                    # each cycle. Shift during a later cycle must not mistake
+                    # the previous cycle's completed reload for the current
+                    # phase.
+                    self._reload_started.clear()
+                    self._reload_completed.clear()
+                elif update.phase is WorkerProgress.RELOAD_COMPLETED:
+                    self._reload_completed.set()
+                self._on_progress(self.token, update)
+
             result = self._engine.run_macro(
                 self.mode,
                 self.cancel_event,
                 self._shutdown,
-                lambda progress: self._on_progress(self.token, progress),
+                macro_progress,
+                self._finish_after_reload,
+                self._reload_started.set,
             )
-        elif self.request.kind is WorkerKind.PREPARATION:
+        elif self.request.kind in (
+            WorkerKind.PREPARATION,
+            WorkerKind.RELOAD_ONLY,
+        ):
             result = self._engine.prepare_reload(
                 self.mode,
                 self.request.switch_settle_ms,
                 self.cancel_event,
                 self._shutdown,
+                lambda update: self._on_progress(self.token, update),
+            )
+        elif self.request.kind is WorkerKind.AIM_OFF:
+            result = self._engine.send_aim_off(
+                self.cancel_event,
+                self._shutdown,
+                self._aim_started.set,
+                self._aim_sent.set,
             )
         elif self.request.kind is WorkerKind.BYPASS:
             result = self._engine.forward_bypass(

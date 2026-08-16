@@ -26,7 +26,7 @@ from .models import (
     CycleStep,
     EventSource,
     OutputAction,
-    WorkerProgress,
+    WorkerProgressUpdate,
     WorkerRequest,
     WorkerResult,
 )
@@ -75,7 +75,7 @@ def _worker_factory(
                 )
             )
 
-        def progress(worker_token: int, update: WorkerProgress) -> None:
+        def progress(worker_token: int, update: WorkerProgressUpdate) -> None:
             event_queue.put_nowait(
                 ControlEvent(
                     ControlEventKind.WORKER_PROGRESS,
