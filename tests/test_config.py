@@ -29,8 +29,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.secondary.shots_per_cycle, 13)
         self.assertEqual(config.controls.deferred_bypass_click_ms, 20)
         self.assertTrue(config.weapons.reload_on_select)
-        self.assertTrue(config.weapons.reload_before_start_if_unknown)
         self.assertEqual(config.weapons.switch_settle_ms, 500)
+        self.assertEqual(config.behavior.start_policy, "immediate")
         self.assertFalse(config.diagnostics.ctrl_bypass_logging)
         self.assertFalse(config.diagnostics.state_tracing)
 
@@ -88,6 +88,12 @@ class ConfigTests(unittest.TestCase):
         raw = raw_config()
         raw["weapons"]["switch_settle_ms"] = -1
         with self.assertRaisesRegex(ConfigError, "non-negative"):
+            parse_config(raw)
+
+    def test_only_immediate_start_policy_is_supported(self) -> None:
+        raw = raw_config()
+        raw["behavior"]["start_policy"] = "prepared"
+        with self.assertRaisesRegex(ConfigError, "supports only 'immediate'"):
             parse_config(raw)
 
     def test_missing_value_has_clear_path(self) -> None:

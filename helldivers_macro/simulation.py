@@ -20,13 +20,14 @@ from .input_hooks import (
     WM_RBUTTONDOWN,
     WM_RBUTTONUP,
 )
-from .macro_engine import MacroEngine
+from .macro_engine import MacroEngine, primary_cycle_steps, secondary_cycle_steps
 from .models import (
     ControlEvent,
     ControlEventKind,
     EventSource,
     MagazineState,
     MacroState,
+    OutputAction,
     WeaponMode,
     WorkerKind,
     WorkerProgress,
@@ -173,6 +174,52 @@ class FakeSessionWorker:
             )
         self.finish(result)
 
+    def begin_reload(self) -> None:
+        if self.request.kind is not WorkerKind.PREPARATION or self.completed:
+            raise AssertionError("only an active preparation can begin reload")
+        self.harness.backend.reload_down()
+
+    def complete_cycle_reload(self) -> None:
+        if self.request.kind is not WorkerKind.MACRO or self.completed:
+            raise AssertionError("only an active macro can complete a cycle")
+        steps = (
+            primary_cycle_steps(self.harness.config)
+            if self.request.mode is WeaponMode.PRIMARY
+            else secondary_cycle_steps(self.harness.config)
+        )
+        # activate() already scheduled the cycle's first MB1-down.
+        for step in steps[1:]:
+            if step.action is OutputAction.WAIT:
+                self.harness.clock.advance_ms(step.duration_ms)
+            elif step.action is OutputAction.MB1_DOWN:
+                self.harness.backend.mouse_down()
+                self.harness.put_worker_event(
+                    ControlEventKind.WORKER_PROGRESS,
+                    self,
+                    WorkerProgress.SHOT_BEGAN,
+                )
+            elif step.action is OutputAction.MB1_UP:
+                self.harness.backend.mouse_up()
+            elif step.action is OutputAction.R_DOWN:
+                self.harness.backend.reload_down()
+            elif step.action is OutputAction.R_UP:
+                self.harness.backend.reload_up()
+        self.harness.put_worker_event(
+            ControlEventKind.WORKER_PROGRESS,
+            self,
+            WorkerProgress.RELOAD_COMPLETE,
+        )
+
+    def begin_next_cycle(self) -> None:
+        if self.request.kind is not WorkerKind.MACRO or self.completed:
+            raise AssertionError("only an active macro can begin another cycle")
+        self.harness.backend.mouse_down()
+        self.harness.put_worker_event(
+            ControlEventKind.WORKER_PROGRESS,
+            self,
+            WorkerProgress.SHOT_BEGAN,
+        )
+
     def finish_bypass_release(self) -> None:
         if self.request.kind is not WorkerKind.BYPASS or self.completed:
             return
@@ -184,14 +231,24 @@ class FakeSessionWorker:
     def finish(self, result: WorkerResult) -> None:
         if self.completed:
             return
+        if self.request.kind is WorkerKind.PREPARATION and self.cancel_requested:
+            self.harness.backend.reload_up()
         self.completed = True
         self.alive = False
         self.harness.put_worker_event(ControlEventKind.WORKER_STOPPED, self, result)
 
-    def cancel_and_release(self) -> BaseException | None:
+    def cancel(self) -> None:
         self.cancel_requested = True
+
+    def cancel_and_release(self) -> BaseException | None:
+        self.cancel()
         try:
-            self.harness.backend.release_all()
+            if self.request.kind is WorkerKind.PREPARATION:
+                self.harness.backend.reload_up()
+            elif self.request.kind is WorkerKind.BYPASS:
+                self.harness.backend.mouse_up()
+            else:
+                self.harness.backend.release_all()
         except BaseException as exc:
             return exc
         if self.harness.auto_complete_cancel:
@@ -429,7 +486,7 @@ def simulate_weapon_session(
 
 def _scenario_a(config: AppConfig) -> str:
     assert simulate_weapon_session(config, WeaponMode.PRIMARY).passed
-    return "PRIMARY prepared, fired, and stopped"
+    return "PRIMARY fired immediately and stopped"
 
 
 def _scenario_b(config: AppConfig) -> str:
@@ -448,15 +505,15 @@ def _scenario_c(config: AppConfig) -> str:
 
 def _scenario_d(config: AppConfig) -> str:
     h = SimulationHarness(config, auto_complete_preparation=False)
-    assert h.click() == (True, True)
-    assert h.machine.enabled and h.machine.pending_start and h.machine.preparing
-    worker = h.machine.worker
-    assert isinstance(worker, FakeSessionWorker)
-    worker.finish_preparation()
+    before = h.clock.now
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
     h.drain()
     assert h.machine.state is MacroState.RUNNING_PRIMARY
+    assert h.machine.enabled and not h.machine.preparing
+    assert h.clock.now == before
     assert h.audio.events == ["ON"]
-    return "UNKNOWN start queued once and fired after preparation"
+    assert [name for name, _state in h.backend.events] == ["MB1_DOWN"]
+    return "UNKNOWN PRIMARY fired on MB1-down without preparation"
 
 
 def _scenario_e(config: AppConfig) -> str:
@@ -555,7 +612,7 @@ def _aim_chord(config: AppConfig, mode: WeaponMode) -> None:
     assert not h.policy.mouse(WM_RBUTTONUP, 0, 0)
     passed_mb2.append("MB2_UP")
     assert passed_mb2 == ["MB2_DOWN", "MB2_UP"]
-    assert h.machine.generation == baseline_generation + 1
+    assert h.machine.generation == baseline_generation + 2
     assert sum(name == "R_DOWN" for name, _state in h.backend.events) == baseline_reloads
     assert not any("RIGHT" in report for report in h.reports)
 
@@ -572,7 +629,6 @@ def _scenario_k(config: AppConfig) -> str:
     before = (
         h.machine.state,
         h.machine.generation,
-        h.machine.pending_start,
         tuple(h.audio.events),
     )
     for message in (WM_KEYDOWN, WM_KEYDOWN, WM_KEYUP):
@@ -581,21 +637,18 @@ def _scenario_k(config: AppConfig) -> str:
     assert before == (
         h.machine.state,
         h.machine.generation,
-        h.machine.pending_start,
         tuple(h.audio.events),
     )
     h.click()
-    waiting = (
+    firing_after_preparation_cancel = (
         h.machine.state,
         h.machine.generation,
-        h.machine.pending_start,
         tuple(h.audio.events),
     )
     h.key_press(VK_LSHIFT, repeats=2)
-    assert waiting == (
+    assert firing_after_preparation_cancel == (
         h.machine.state,
         h.machine.generation,
-        h.machine.pending_start,
         tuple(h.audio.events),
     )
     for mode in (WeaponMode.PRIMARY, WeaponMode.SECONDARY):
@@ -612,7 +665,7 @@ def _scenario_k(config: AppConfig) -> str:
             firing.machine.generation,
             tuple(firing.audio.events),
         )
-    return "Shift was isolated during preparation, waiting, and firing"
+    return "Shift was isolated during preparation and immediate firing"
 
 
 def _scenario_l(config: AppConfig) -> str:
@@ -628,7 +681,7 @@ def _scenario_l(config: AppConfig) -> str:
     h.drain()
     assert h.machine.selected_mode is WeaponMode.SECONDARY
     assert not h.machine.enabled and not h.machine.firing
-    assert not h.machine.pending_start and not h.backend.mouse_owned
+    assert not h.backend.mouse_owned
     assert h.audio.events == ["ON", "OFF"]
     return "Ctrl cancellation survived stale worker completion without restart"
 
@@ -713,6 +766,132 @@ def _scenario_n(config: AppConfig) -> str:
     return "trace reasons were transition-local with monotonic sequence numbers"
 
 
+def _scenario_o(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=True, auto_complete_preparation=False)
+    before = h.clock.now
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    h.drain()
+    assert h.clock.now == before
+    assert h.machine.enabled and h.machine.state is MacroState.RUNNING_PRIMARY
+    assert h.audio.events == ["ON"]
+    assert h.backend.events == [("MB1_DOWN", "RUNNING_PRIMARY")]
+    events = [report.split("event=", 1)[1].split(" ", 1)[0] for report in h.reports if report.startswith("TRACE:")]
+    assert events[-2:] == ["MACRO_ENABLED", "FIRING_STARTED"]
+    assert not any(name.startswith("R_") for name, _state in h.backend.events)
+    assert ControlEventKind.PHYSICAL_MB1_UP not in h.hook_events
+    return "UNKNOWN PRIMARY scheduled its first shot at elapsed 0 ms"
+
+
+def _scenario_p(config: AppConfig) -> str:
+    h = SimulationHarness(
+        config, trace=True, auto_complete_preparation=False, auto_complete_cancel=False
+    )
+    h.key_press(VK_2)
+    preparation = h.machine.worker
+    assert isinstance(preparation, FakeSessionWorker)
+    generation = h.machine.generation
+    before = h.clock.now
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    h.drain()
+    assert h.clock.now == before
+    assert preparation.cancel_requested
+    assert h.machine.generation > generation
+    assert h.machine.state is MacroState.RUNNING_SECONDARY
+    assert h.audio.events == ["ON"]
+    assert h.backend.events[-1] == ("MB1_DOWN", "RUNNING_SECONDARY")
+    trace_events = [
+        report.split("event=", 1)[1].split(" ", 1)[0]
+        for report in h.reports
+        if report.startswith("TRACE:")
+    ]
+    assert trace_events[-3:] == [
+        "MACRO_ENABLED",
+        "PREPARATION_CANCELED",
+        "FIRING_STARTED",
+    ]
+    preparation.finish(WorkerResult(True))
+    h.drain()
+    assert h.machine.state is MacroState.RUNNING_SECONDARY
+    assert h.machine.magazine_state(WeaponMode.SECONDARY) is MagazineState.UNKNOWN
+    assert h.audio.events == ["ON"]
+    return "SECONDARY firing preempted switch settle without advancing time"
+
+
+def _scenario_q(config: AppConfig) -> str:
+    h = SimulationHarness(
+        config, trace=True, auto_complete_preparation=False, auto_complete_cancel=False
+    )
+    h.key_press(VK_2)
+    secondary = h.machine.worker
+    assert isinstance(secondary, FakeSessionWorker)
+    h.key_press(VK_1)
+    secondary.finish(WorkerResult(False, canceled=True))
+    h.drain()
+    preparation = h.machine.worker
+    assert isinstance(preparation, FakeSessionWorker)
+    assert preparation.request.mode is WeaponMode.PRIMARY
+    preparation.begin_reload()
+    before = h.clock.now
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    h.drain()
+    assert h.clock.now == before
+    assert preparation.cancel_requested
+    assert h.machine.state is MacroState.RUNNING_PRIMARY
+    assert [name for name, _state in h.backend.events][-2:] == ["R_DOWN", "MB1_DOWN"]
+    preparation.finish(WorkerResult(True))
+    h.drain()
+    self_kinds = [worker.request.kind for worker in h.workers]
+    assert self_kinds.count(WorkerKind.MACRO) == 1
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
+    assert h.audio.events == ["ON"]
+    return "active reload was canceled and stale FULL authority was ignored"
+
+
+def _scenario_r(config: AppConfig) -> str:
+    h = SimulationHarness(config, auto_complete_cancel=False)
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    h.drain()
+    macro = h.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    assert h.policy.mouse(WM_LBUTTONUP, 0, 0)
+    h.drain()
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    h.drain()
+    assert not h.machine.enabled and not h.backend.mouse_owned
+    assert h.audio.events == ["ON"]
+    assert not any(name == "R_DOWN" for name, _state in h.backend.events)
+    macro.finish(WorkerResult(False, canceled=True))
+    h.drain()
+    assert h.audio.events == ["ON", "OFF"]
+    assert h.machine.state is MacroState.IDLE_PRIMARY
+    assert not h.machine.enabled and not h.backend.mouse_owned
+    return "next MB1-down stopped immediately with one OFF after cleanup"
+
+
+def _scenario_s(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    h.drain()
+    macro = h.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
+    macro.complete_cycle_reload()
+    h.drain()
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.FULL
+    macro.begin_next_cycle()
+    h.drain()
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
+    assert h.machine.enabled and h.machine.state is MacroState.RUNNING_PRIMARY
+    assert h.audio.events == ["ON"]
+    names = [name for name, _state in h.backend.events]
+    reload_down = names.index("R_DOWN")
+    reload_up = names.index("R_UP")
+    assert reload_down < reload_up < len(names) - 1
+    assert names[-1] == "MB1_DOWN"
+    return "first cycle reload synchronized FULL before the next cycle began"
+
+
 _SCENARIOS = (
     ("A", _scenario_a),
     ("B", _scenario_b),
@@ -728,6 +907,11 @@ _SCENARIOS = (
     ("L", _scenario_l),
     ("M", _scenario_m),
     ("N", _scenario_n),
+    ("O", _scenario_o),
+    ("P", _scenario_p),
+    ("Q", _scenario_q),
+    ("R", _scenario_r),
+    ("S", _scenario_s),
 )
 
 

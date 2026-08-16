@@ -20,7 +20,7 @@ project does not provide a bypass or elevated-mode workaround.
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
 6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through N with fake hooks, input, foreground, time, workers,
+   scenarios A through S with fake hooks, input, foreground, time, workers,
    and audio only.
 7. Review both dry runs before deliberately choosing `--live`.
 
@@ -36,11 +36,9 @@ physical down/up cycle.
 
 The internally selected weapon is PRIMARY at startup. A selection for the
 already selected mode is an internal no-op in every phase, including idle,
-preparing, enabled-waiting, firing, and stopping. It cannot disable, reload,
-change magazine state, replace a generation, clear a pending start, or emit
-audio. The physical number key still reaches the game. With PRIMARY still
-selected and `UNKNOWN`, the first unmodified MB1-down performs the required
-reload-before-start preparation instead.
+preparing, firing, and stopping. It cannot disable, reload, change magazine
+state, replace a generation, or emit audio. The physical number key still
+reaches the game.
 
 With the default configuration, selection of the *other* weapon does the
 following without starting fire: cancel and clean up existing work, select the
@@ -48,6 +46,12 @@ requested weapon, mark it
 `UNKNOWN`, wait `weapons.switch_settle_ms`, generate the configured `R` press,
 wait the complete weapon-specific reload time, then mark it `FULL` and arm it
 only if every operation and foreground check succeeded.
+
+Selection preparation is background work. An accepted MB1-down always wins: it
+cancels and invalidates unfinished switch-settle/reload preparation without
+joining or waiting for that worker, then schedules firing immediately. If
+preparation completed and was reconciled first, the magazine may be `FULL`;
+otherwise firing begins with `UNKNOWN` ammunition state.
 
 The preparation lifecycle is explicit:
 
@@ -64,17 +68,29 @@ and cannot leave the controller stuck in `PREPARING`.
 game-specific constant. Increase it if reload occurs before the selected weapon
 is ready. Selection never starts firing automatically.
 
-## MB1 down-edge toggle and reload-before-start
+## Immediate MB1 down-edge toggle
 
 An unmodified physical MB1 pair beginning while Helldivers is freshly confirmed
 foreground is suppressed. Its accepted physical down edge toggles the selected
 macro immediately. MB1-up is cleanup-only: it clears physical/pair state and
-never starts, rejects, toggles, prepares, changes weapons, or emits audio. If
-the selected weapon is `UNKNOWN`, the down edge queues one pending start and
-runs reload preparation first; ON is not played during preparation. Successful
-preparation atomically consumes that request, enters `RUNNING_PRIMARY` or
-`RUNNING_SECONDARY`, queues ON once, and only then permits generated MB1.
-Focus loss or cancellation clears the pending request.
+never starts, rejects, toggles, prepares, changes weapons, or emits audio. On
+the accepted down edge the controller sets `enabled`, queues ON, invalidates
+and nonblockingly cancels any background preparation, publishes
+`RUNNING_PRIMARY` or `RUNNING_SECONDARY`, and activates generated firing in the
+same controller reconciliation. It does not wait for MB1-up, switch settle,
+reload input, reload completion, or preparation-thread exit.
+
+The configured policy is explicit:
+
+```toml
+[behavior]
+start_policy = "immediate"
+```
+
+Only `immediate` is supported. Deterministic fake-clock tests schedule the first
+generated MB1-down at 0 ms; the application-controlled target is at most 50 ms
+from accepted physical MB1-down. Windows scheduling and the game are outside
+that measurement.
 
 If the weapon is `FULL`, firing starts without an unnecessary reload. A later
 accepted MB1-down disables and starts cleanup. Its matching up remains paired
@@ -115,8 +131,8 @@ Focus loss or input failure discards forwarding and releases any owned input.
 Holding Ctrl and waiting for OFF before clicking remains the simplest manual
 procedure, but the deferred path protects rapid clicks.
 
-Ctrl disables an enabled macro before canceling work, clears pending start,
-invalidates the worker generation, and cannot enter preparation or restore
+Ctrl disables an enabled macro before canceling work, invalidates the worker
+generation, and cannot enter preparation or restore
 `enabled`. Ctrl-up and stale worker completion cannot restart it; a later,
 distinct unmodified MB1-down is required. Ctrl alone is state-neutral while
 the macro is disabled. Ctrl+MB1 always marks the selected magazine `UNKNOWN`.
@@ -133,13 +149,13 @@ pair decisions, and deferred-forwarding stages.
 For controller troubleshooting, set `diagnostics.state_tracing = true`. Each
 record has a monotonic sequence number, normalized event, exact event source,
 previous/result state values, selected weapon, conservative magazine state,
-generation, pending-start status, foreground certainty, and a transition-local
+generation, foreground certainty, elapsed milliseconds, and a transition-local
 reason. Old cancellation reasons are never carried into later transitions. A
 rejected start uses the same structured record with the `START_REJECTED:`
 prefix:
 
 ```text
-START_REJECTED: seq=<n> event=START_REJECTED source=<source> previous=[...] result=[...] generation=<n> reason=<reason>
+START_REJECTED: seq=<n> elapsed_ms=<ms> event=START_REJECTED source=<source> previous=[...] result=[...] generation=<n> reason=<reason>
 ```
 
 If firing does not begin, first run `--simulate-session`. If that passes, enable
@@ -151,7 +167,7 @@ options are disabled by default and never log unrelated user input.
 otherwise inert same-mode selection.
 
 Confirmed foreground loss is one transaction: disable, invalidate the
-generation, clear pending start, cancel work, release owned input, retain the
+generation, cancel work, release owned input, retain the
 selected weapon, and mark affected ammunition `UNKNOWN`. Foreground regain
 alone never reloads, fires, plays audio, or replays clicks. A physical MB1-up
 must establish neutral input before a new toggle is accepted, and a selection
@@ -173,6 +189,15 @@ verified reload, interrupted preparation, focus loss during firing/reloading,
 input failure, shutdown during a cycle, selection, or manual Ctrl+MB1 leaves it
 `UNKNOWN`.
 
+Immediate activation deliberately prioritizes latency over a guaranteed-full
+magazine. The first cycle uses whatever ammunition is currently available; it
+may dry-fire or fire fewer configured shots when the magazine is empty or
+partial. The macro becomes synchronized only after its first successful normal
+cycle reload completes. If a background preparation already issued `R`, firing
+is still scheduled and Helldivers decides whether the shot interrupts or is
+delayed by its reload/weapon-switch animation. Immediate scheduling does not
+mean guaranteed ammunition or guaranteed immediate in-game response.
+
 The game may ignore or interrupt a reload. `FULL` cannot guarantee ammunition
 when reserve ammunition is empty. Reloading a partial magazine may discard
 remaining ammunition depending on game mechanics. If absolute certainty is
@@ -190,18 +215,25 @@ SECONDARY repeats exactly 13 shots. Each is MB1 down 35 ms, up, then wait
 scan-code `R` down 25 ms, up, waits 2000 ms, and repeats. The firing cycle is
 4365 ms.
 
-These dry-cycle durations describe firing after preparation. Selection also
-adds the configured switch-settle time and a full reload sequence. Every wait
+These dry-cycle durations start immediately after activation; they do not wait
+for selection preparation. Background selection may still add switch-settle
+and reload work if it finishes before activation. Every macro/preparation wait
 checks cancellation and fresh foreground ownership at 5 ms intervals.
+
+The shared output lock is held only around individual output calls and cleanup,
+never during switch-settle, press-duration, or reload waits. Immediate start
+signals preparation cancellation without acquiring that lock or joining the
+thread. A retired preparation may release only its owned `R`; it cannot release
+the current macro's MB1. State and generated-input ownership are published
+before the firing worker is activated.
 
 ## Audio
 
-- ON: 1000 Hz for 100 ms, only when actual macro firing begins.
+- ON: 1000 Hz for 100 ms, queued once on an accepted immediate enable edge.
 - OFF: 500 Hz for 150 ms, exactly once when an enabled macro is disabled and
   owned-input cleanup has completed.
 
-Preparation, selection, startup, and idle cancellation are silent. ON is never
-queued until the state is actually running. Audio uses a
+Preparation, selection, startup, and idle cancellation are silent. Audio uses a
 dedicated FIFO thread and cannot delay hook callbacks, input release, or timing.
 `--test-audio` prints `Playing ON signal...`, then `Playing OFF signal...`, and
 finally `Audio test complete.` It drains both accepted tones before returning;
@@ -224,10 +256,10 @@ Only `--live` installs hooks, suppresses paired physical MB1, or generates
 input. `--test-audio` plays only the configured tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through N and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
-primary/secondary sessions, key edges, pending preparation, deferred bypass,
-same-mode firing, aim chords, Shift isolation, Ctrl stale completion,
-foreground neutral rearming, and trace-local reasons all pass.
+A through S and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+the existing controller regressions plus immediate UNKNOWN start, switch-settle
+preemption, active-reload preemption, immediate stop, and first-cycle reload
+synchronization all pass.
 
 The complete non-live validation set is:
 
@@ -251,4 +283,6 @@ executable, or third-party Python package is used.
 Windows can remove a low-level hook if a callback stalls; callbacks here only
 update small physical state, latch a decision, and enqueue work. Hook/message
 loop failure cancels work. UIPI or the game may reject `SendInput`. If ordinary
-input is rejected, stop using live mode; no bypass is implemented.
+input is rejected, stop using live mode; no bypass is implemented. Python can
+schedule promptly but cannot force Helldivers to accept or immediately act on
+input during a weapon-switch/reload animation.

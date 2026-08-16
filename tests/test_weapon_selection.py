@@ -56,17 +56,14 @@ class WeaponSelectionTests(unittest.TestCase):
             ),
         )
 
-    def test_same_mode_during_preparation_preserves_generation_and_pending(self) -> None:
+    def test_same_mode_during_preparation_preserves_generation_and_worker(self) -> None:
         h = SimulationHarness(CONFIG, trace=False, auto_complete_preparation=False)
         h.key_press(VK_2)
         worker = h.machine.worker
         generation = h.machine.generation
-        h.click()
-        self.assertTrue(h.machine.pending_start)
         h.key_press(VK_2, repeats=3)
         self.assertIs(h.machine.worker, worker)
         self.assertEqual(h.machine.generation, generation)
-        self.assertTrue(h.machine.pending_start)
         self.assertEqual(len(h.workers), 1)
 
     def test_same_mode_while_firing_does_not_stop_or_emit_audio(self) -> None:

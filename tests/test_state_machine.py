@@ -44,43 +44,47 @@ class StateMachineTests(unittest.TestCase):
                 PreparationLifecycle.IDLE_UNKNOWN,
             )
 
-    def test_unknown_start_enters_preparing_with_one_pending_request(self) -> None:
+    def test_unknown_primary_starts_immediately_without_reload_or_clock_advance(self) -> None:
         h = SimulationHarness(CONFIG, trace=False, auto_complete_preparation=False)
-        h.click()
+        before = h.clock.now
+        self.assertTrue(h.policy.mouse(WM_LBUTTONDOWN, 0, 0))
+        h.drain()
         self.assertTrue(h.machine.enabled)
-        self.assertTrue(h.machine.pending_start)
-        self.assertTrue(h.machine.preparing)
-        self.assertIs(h.machine.state, MacroState.PREPARING_PRIMARY)
+        self.assertFalse(h.machine.preparing)
+        self.assertIs(h.machine.state, MacroState.RUNNING_PRIMARY)
         self.assertEqual(len(h.workers), 1)
-        self.assertIs(h.workers[0].request.kind, WorkerKind.PREPARATION)
-        self.assertEqual(h.audio.events, [])
+        self.assertIs(h.workers[0].request.kind, WorkerKind.MACRO)
+        self.assertEqual(h.audio.events, ["ON"])
+        self.assertEqual(h.clock.now, before)
+        self.assertEqual(h.backend.events, [("MB1_DOWN", "RUNNING_PRIMARY")])
 
-    def test_preparation_success_consumes_pending_and_starts_once(self) -> None:
+    def test_background_preparation_success_marks_full_without_starting(self) -> None:
         h = SimulationHarness(CONFIG, trace=False, auto_complete_preparation=False)
-        h.click()
+        h.key_press(VK_2)
         prep = h.machine.worker
         self.assertIsInstance(prep, FakeSessionWorker)
         prep.finish_preparation()
         h.drain()
-        self.assertFalse(h.machine.pending_start)
-        self.assertIs(h.machine.state, MacroState.RUNNING_PRIMARY)
-        self.assertEqual(h.audio.events, ["ON"])
-        self.assertEqual([w.request.kind for w in h.workers].count(WorkerKind.MACRO), 1)
+        self.assertIs(h.machine.state, MacroState.IDLE_SECONDARY)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.FULL
+        )
+        self.assertEqual(h.audio.events, [])
+        self.assertEqual([w.request.kind for w in h.workers].count(WorkerKind.MACRO), 0)
 
-    def test_failed_preparation_returns_idle_unknown_and_clears_pending(self) -> None:
+    def test_failed_background_preparation_returns_idle_unknown(self) -> None:
         h = SimulationHarness(CONFIG, trace=False, auto_complete_preparation=False)
-        h.click()
+        h.key_press(VK_2)
         prep = h.machine.worker
         self.assertIsInstance(prep, FakeSessionWorker)
         prep.finish_preparation(WorkerResult(False, error=RuntimeError("fake R failure")))
         h.drain()
-        self.assertIs(h.machine.state, MacroState.IDLE_PRIMARY)
+        self.assertIs(h.machine.state, MacroState.IDLE_SECONDARY)
         self.assertFalse(h.machine.enabled)
-        self.assertFalse(h.machine.pending_start)
         self.assertFalse(h.machine.preparing)
-        self.assertIs(h.machine.magazine_state(WeaponMode.PRIMARY), MagazineState.UNKNOWN)
+        self.assertIs(h.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.UNKNOWN)
         self.assertIs(
-            h.machine.preparation_lifecycle(WeaponMode.PRIMARY),
+            h.machine.preparation_lifecycle(WeaponMode.SECONDARY),
             PreparationLifecycle.IDLE_UNKNOWN,
         )
         self.assertTrue(any("fake R failure" in message for message in h.reports))
@@ -89,10 +93,81 @@ class StateMachineTests(unittest.TestCase):
         h = SimulationHarness(CONFIG, trace=False)
         h.make_full(WeaponMode.SECONDARY)
         reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
-        h.click()
+        self.assertTrue(h.policy.mouse(WM_LBUTTONDOWN, 0, 0))
+        h.machine.handle(h.events.get_nowait())
         self.assertIs(h.machine.state, MacroState.RUNNING_SECONDARY)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.FULL
+        )
         self.assertEqual(
             sum(name == "R_DOWN" for name, _state in h.backend.events), reloads
+        )
+        h.drain()
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.UNKNOWN
+        )
+
+    def test_secondary_start_preempts_switch_settle_in_trace_order(self) -> None:
+        h = SimulationHarness(
+            CONFIG,
+            trace=True,
+            auto_complete_preparation=False,
+            auto_complete_cancel=False,
+        )
+        h.key_press(VK_2)
+        preparation = h.machine.worker
+        self.assertIsInstance(preparation, FakeSessionWorker)
+        before = h.clock.now
+        self.assertTrue(h.policy.mouse(WM_LBUTTONDOWN, 0, 0))
+        h.drain()
+        self.assertEqual(h.clock.now, before)
+        self.assertTrue(preparation.cancel_requested)
+        self.assertIs(h.machine.state, MacroState.RUNNING_SECONDARY)
+        self.assertEqual(h.audio.events, ["ON"])
+        self.assertEqual(h.backend.events, [("MB1_DOWN", "RUNNING_SECONDARY")])
+        trace_events = [
+            record.split("event=", 1)[1].split(" ", 1)[0]
+            for record in h.reports
+            if record.startswith("TRACE:")
+        ]
+        self.assertEqual(
+            trace_events[-3:],
+            ["MACRO_ENABLED", "PREPARATION_CANCELED", "FIRING_STARTED"],
+        )
+        trace_records = [
+            record for record in h.reports if record.startswith("TRACE:")
+        ]
+        self.assertTrue(all("elapsed_ms=" in record for record in trace_records))
+        enabled = next(record for record in trace_records if "event=MACRO_ENABLED" in record)
+        firing = next(record for record in trace_records if "event=FIRING_STARTED" in record)
+        elapsed = lambda record: float(record.split("elapsed_ms=", 1)[1].split(" ", 1)[0])
+        self.assertLessEqual(elapsed(firing) - elapsed(enabled), 50.0)
+
+    def test_stale_preparation_completion_cannot_publish_full_or_duplicate_start(self) -> None:
+        h = SimulationHarness(
+            CONFIG,
+            trace=False,
+            auto_complete_preparation=False,
+            auto_complete_cancel=False,
+        )
+        h.key_press(VK_2)
+        preparation = h.machine.worker
+        self.assertIsInstance(preparation, FakeSessionWorker)
+        h.click()
+        macro = h.machine.worker
+        self.assertIsInstance(macro, FakeSessionWorker)
+        self.assertIs(macro.request.kind, WorkerKind.MACRO)
+        preparation.finish(WorkerResult(True))
+        h.drain()
+        self.assertIs(h.machine.worker, macro)
+        self.assertIs(h.machine.state, MacroState.RUNNING_SECONDARY)
+        self.assertIs(
+            h.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.UNKNOWN
+        )
+        self.assertEqual(h.audio.events, ["ON"])
+        self.assertEqual(
+            [worker.request.kind for worker in h.workers].count(WorkerKind.MACRO),
+            1,
         )
 
     def test_macro_shot_marks_unknown_and_completed_reload_marks_full(self) -> None:
@@ -148,7 +223,6 @@ class StateMachineTests(unittest.TestCase):
         self.assertIs(h.machine.selected_mode, WeaponMode.SECONDARY)
         self.assertFalse(h.machine.enabled)
         self.assertFalse(h.machine.firing)
-        self.assertFalse(h.machine.pending_start)
         self.assertFalse(h.backend.mouse_owned)
         self.assertFalse(any(w.request.kind is WorkerKind.PREPARATION for w in h.workers[2:]))
 
@@ -157,7 +231,6 @@ class StateMachineTests(unittest.TestCase):
         before = (
             h.machine.state,
             h.machine.generation,
-            h.machine.pending_start,
             tuple(h.audio.events),
         )
         h.policy.keyboard(WM_KEYDOWN, VK_LCONTROL, 0)
@@ -168,7 +241,6 @@ class StateMachineTests(unittest.TestCase):
             (
                 h.machine.state,
                 h.machine.generation,
-                h.machine.pending_start,
                 tuple(h.audio.events),
             ),
         )
@@ -244,7 +316,6 @@ class StateMachineTests(unittest.TestCase):
         h.foreground_loss()
         self.assertFalse(h.machine.enabled)
         self.assertFalse(h.backend.mouse_owned)
-        self.assertFalse(h.machine.pending_start)
         macro.finish(WorkerResult(False, canceled=True))
         h.drain()
         h.foreground.active = True

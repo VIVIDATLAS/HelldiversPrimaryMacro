@@ -144,10 +144,11 @@ class MacroEngine:
         success: bool,
         canceled: bool,
         error: BaseException | None,
+        release_owned: Callable[[], None],
     ) -> WorkerResult:
         try:
             with self.io_lock:
-                self.backend.release_all()
+                release_owned()
         except BaseException as release_exc:
             if error is None:
                 error = release_exc
@@ -191,7 +192,12 @@ class MacroEngine:
             error = exc
         except BaseException as exc:  # Worker boundary; cleanup still has priority.
             error = exc
-        return self._finish_result(success=False, canceled=canceled, error=error)
+        return self._finish_result(
+            success=False,
+            canceled=canceled,
+            error=error,
+            release_owned=self.backend.release_all,
+        )
 
     def prepare_reload(
         self,
@@ -225,7 +231,12 @@ class MacroEngine:
         except BaseException as exc:
             error = exc
         return self._finish_result(
-            success=success, canceled=canceled, error=error
+            success=success,
+            canceled=canceled,
+            error=error,
+            # A retired preparation may overlap a newly started macro. It may
+            # release only the R key it could own, never the new macro's MB1.
+            release_owned=self.backend.reload_up,
         )
 
     def forward_bypass(
@@ -265,7 +276,10 @@ class MacroEngine:
         except BaseException as exc:
             error = exc
         return self._finish_result(
-            success=success, canceled=canceled, error=error
+            success=success,
+            canceled=canceled,
+            error=error,
+            release_owned=self.backend.release_all,
         )
 
 
@@ -300,12 +314,19 @@ class MacroWorker:
     def activate(self) -> None:
         self._activation.set()
 
-    def cancel_and_release(self) -> BaseException | None:
+    def cancel(self) -> None:
+        """Request cancellation without acquiring the output serialization lock."""
         self.cancel_event.set()
         self._activation.set()
+
+    def cancel_and_release(self) -> BaseException | None:
+        self.cancel()
         try:
             with self._engine.io_lock:
-                self._engine.backend.release_all()
+                if self.request.kind is WorkerKind.PREPARATION:
+                    self._engine.backend.reload_up()
+                else:
+                    self._engine.backend.release_all()
         except BaseException as exc:
             return exc
         return None

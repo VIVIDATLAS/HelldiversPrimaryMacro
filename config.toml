@@ -15,8 +15,10 @@ deferred_bypass_click_ms = 20
 
 [weapons]
 reload_on_select = true
-reload_before_start_if_unknown = true
 switch_settle_ms = 500
+
+[behavior]
+start_policy = "immediate"
 
 [diagnostics]
 ctrl_bypass_logging = false

@@ -8,6 +8,7 @@ from helldivers_macro.config import load_config
 from helldivers_macro.input_backend import InputApiError
 from helldivers_macro.macro_engine import (
     MacroEngine,
+    MacroWorker,
     primary_cycle_steps,
     secondary_cycle_steps,
 )
@@ -15,7 +16,9 @@ from helldivers_macro.models import (
     CycleStep,
     OutputAction,
     WeaponMode,
+    WorkerKind,
     WorkerProgress,
+    WorkerRequest,
 )
 
 
@@ -40,6 +43,8 @@ class RecordingBackend:
         self._event("MB1_DOWN")
 
     def mouse_up(self) -> None:
+        if not self.mouse_owned:
+            return
         self._event("MB1_UP")
         self.mouse_owned = False
 
@@ -48,6 +53,8 @@ class RecordingBackend:
         self._event("R_DOWN")
 
     def reload_up(self) -> None:
+        if not self.reload_owned:
+            return
         self._event("R_UP")
         self.reload_owned = False
 
@@ -73,6 +80,20 @@ class FakeTime:
         self.waits.append(seconds)
         self.now += seconds
         return event.is_set()
+
+
+class TrackingLock:
+    def __init__(self) -> None:
+        self.held = False
+
+    def __enter__(self):
+        if self.held:
+            raise AssertionError("unexpected recursive fake lock acquisition")
+        self.held = True
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.held = False
 
 
 class MacroSequenceTests(unittest.TestCase):
@@ -192,6 +213,57 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertEqual(backend.events[:2], ["R_DOWN", "R_UP"])
         self.assertAlmostEqual(fake_time.now, 3.125, places=3)
         self.assertFalse(backend.reload_owned)
+
+    def test_preparation_waits_never_hold_output_lock(self) -> None:
+        backend = RecordingBackend()
+        fake_time = FakeTime()
+        lock = TrackingLock()
+
+        def wait(event: threading.Event, seconds: float) -> bool:
+            self.assertFalse(lock.held)
+            return fake_time.wait(event, seconds)
+
+        engine = MacroEngine(
+            CONFIG,
+            backend,
+            lambda: True,
+            clock=fake_time.clock,
+            wait=wait,
+            io_lock=lock,
+        )
+        result = engine.prepare_reload(
+            WeaponMode.PRIMARY, 500, threading.Event(), threading.Event()
+        )
+        self.assertTrue(result.success)
+        self.assertFalse(lock.held)
+
+    def test_nonblocking_preparation_cancel_does_not_acquire_output_lock(self) -> None:
+        backend = RecordingBackend()
+        engine = MacroEngine(CONFIG, backend, lambda: True, io_lock=TrackingLock())
+        worker = MacroWorker(
+            1,
+            WorkerRequest(WorkerKind.PREPARATION, WeaponMode.PRIMARY),
+            engine,
+            threading.Event(),
+            lambda _token, _result: None,
+            lambda _token, _progress: None,
+        )
+        worker.cancel()
+        self.assertTrue(worker.cancel_event.is_set())
+        self.assertFalse(engine.io_lock.held)
+
+    def test_retired_preparation_cleanup_cannot_release_macro_mouse(self) -> None:
+        backend = RecordingBackend()
+        backend.mouse_owned = True
+        cancel = threading.Event()
+        cancel.set()
+        engine = MacroEngine(CONFIG, backend, lambda: True)
+        result = engine.prepare_reload(
+            WeaponMode.PRIMARY, 500, cancel, threading.Event()
+        )
+        self.assertTrue(result.canceled)
+        self.assertTrue(backend.mouse_owned)
+        self.assertNotIn("MB1_UP", backend.events)
 
     def test_fast_bypass_replays_after_generated_release(self) -> None:
         backend = RecordingBackend()

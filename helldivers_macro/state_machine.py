@@ -32,6 +32,7 @@ class WorkerHandle(Protocol):
 
     def start(self) -> None: ...
     def activate(self) -> None: ...
+    def cancel(self) -> None: ...
     def cancel_and_release(self) -> BaseException | None: ...
     def join(self, timeout: float | None = None) -> None: ...
     def is_alive(self) -> bool: ...
@@ -83,6 +84,7 @@ class MacroStateMachine:
         self._worker_kind: WorkerKind | None = None
         self._worker_mode: WeaponMode | None = None
         self._next_worker_token = 1
+        self._retired_preparations: dict[int, WorkerHandle] = {}
         self._generation = 0
         self._active_preparation_generation: int | None = None
         self._off_pending = False
@@ -90,13 +92,13 @@ class MacroStateMachine:
         self._firing_began = False
         self._macro_reload_invalidated = False
         self._preparation_invalidated = False
-        self._pending_start = False
         self._pending_selection: WeaponMode | None = None
         self._worker_cancel_reason: str | None = None
         self._deferred_release: threading.Event | None = None
         self._deferred_discard = False
         self._foreground_loss_latched = False
         self._trace_sequence = 0
+        self._trace_started_at = self._clock()
         self.fatal_error: BaseException | None = None
 
     @property
@@ -129,10 +131,6 @@ class MacroStateMachine:
     @property
     def armed(self) -> bool:
         return self._armed
-
-    @property
-    def pending_start(self) -> bool:
-        return self._pending_start
 
     def magazine_state(self, mode: WeaponMode) -> MagazineState:
         return self._magazines[mode]
@@ -167,7 +165,6 @@ class MacroStateMachine:
             "magazine": self._magazines[self.selected_mode].value,
             "enabled": self._enabled,
             "firing": self.firing,
-            "pending_start": self._pending_start,
             "physical_mb1_down": self._physical_mb1_down,
             "neutral_rearm": self._neutral_rearm_required,
             "generation": self._generation,
@@ -195,8 +192,10 @@ class MacroStateMachine:
         self._trace_sequence += 1
         normalized = event.strip().upper().replace(" ", "_")
         prefix = "START_REJECTED: " if rejected else "TRACE: "
+        elapsed_ms = (self._clock() - self._trace_started_at) * 1000.0
         self._report(
-            f"{prefix}seq={self._trace_sequence} event={normalized} "
+            f"{prefix}seq={self._trace_sequence} elapsed_ms={elapsed_ms:.3f} "
+            f"event={normalized} "
             f"source={source.value} "
             f"previous=[{self._format_snapshot(previous)}] "
             f"result=[{self._format_snapshot(self._snapshot())}] "
@@ -312,7 +311,6 @@ class MacroStateMachine:
         else:
             # A different selection invalidates preparation/bypass work even
             # when firing has not been enabled.
-            self._pending_start = False
             if self._worker is not None:
                 self._generation += 1
             if self._worker_kind is WorkerKind.PREPARATION:
@@ -381,24 +379,30 @@ class MacroStateMachine:
             return
 
         self._enabled = True
-        self._pending_start = True
+        # Each enabled session owns a fresh authority generation. This also
+        # invalidates any selection preparation before it is detached below.
+        self._generation += 1
+        if self._magazines[self.selected_mode] is not MagazineState.FULL:
+            self._magazines[self.selected_mode] = MagazineState.UNKNOWN
+            self._set_preparation_lifecycle(
+                self.selected_mode, PreparationLifecycle.IDLE_UNKNOWN
+            )
+            self._armed = False
         self._trace(
             "MACRO_ENABLED",
             source=source,
             previous=previous,
             reason="accepted physical MB1-down",
         )
+        try:
+            self._audio.notify_on()
+            self._on_announced = True
+        except BaseException as exc:
+            # Audio must never delay or prevent cancellation or firing.
+            self._report(f"ON audio notification failed: {exc}")
         if self.preparing:
-            return
-        if self._magazines[self.selected_mode] is MagazineState.FULL:
-            self._armed = True
-            self._start_macro(source, "verified full magazine")
-        elif self._config.weapons.reload_before_start_if_unknown:
-            self._armed = False
-            self._start_preparation(0, source, "enabled weapon state unknown")
-        else:
-            self._armed = True
-            self._start_macro(source, "reload-before-start disabled")
+            self._cancel_preparation_for_immediate_start(source)
+        self._start_macro(source, "immediate physical MB1-down activation")
 
     def _mb1_up(self) -> None:
         # Cleanup-only by construction. This method must never authorize start,
@@ -408,7 +412,6 @@ class MacroStateMachine:
 
     def _start_macro(self, source: EventSource, reason: str) -> None:
         previous = self._snapshot()
-        self._pending_start = False
         request = WorkerRequest(
             WorkerKind.MACRO,
             self.selected_mode,
@@ -416,15 +419,54 @@ class MacroStateMachine:
         )
         self._firing_began = False
         self._macro_reload_invalidated = False
-        if not self._start_worker(request, self._running_state(), queue_on=True):
+        def trace_firing_started() -> None:
+            self._trace(
+                "FIRING_STARTED",
+                source=source,
+                previous=previous,
+                reason=reason,
+            )
+
+        if not self._start_worker(
+            request,
+            self._running_state(),
+            before_activate=trace_firing_started,
+        ):
             self._enabled = False
+            if self._on_announced:
+                self._off_pending = True
+                self._finish_off()
             self._start_rejected("macro worker could not start", source, previous)
+
+    def _cancel_preparation_for_immediate_start(
+        self, source: EventSource
+    ) -> None:
+        worker = self._worker
+        if worker is None or self._worker_kind is not WorkerKind.PREPARATION:
             return
+        previous = self._snapshot()
+        mode = self._worker_mode
+        # cancel() only sets events; it does not acquire the backend lock, wait,
+        # join, or release the new macro's MB1 ownership.
+        worker.cancel()
+        self._retired_preparations[worker.token] = worker
+        self._worker = None
+        self._worker_kind = None
+        self._worker_mode = None
+        self._worker_cancel_reason = None
+        self._active_preparation_generation = None
+        self._preparation_invalidated = False
+        if mode is not None:
+            self._magazines[mode] = MagazineState.UNKNOWN
+            self._set_preparation_lifecycle(
+                mode, PreparationLifecycle.IDLE_UNKNOWN
+            )
+        self._set_state(self._idle_state())
         self._trace(
-            "FIRING_STARTED",
+            "PREPARATION_CANCELED",
             source=source,
             previous=previous,
-            reason=reason,
+            reason="immediate_start",
         )
 
     def _start_preparation(
@@ -457,7 +499,6 @@ class MacroStateMachine:
                 PreparationLifecycle.IDLE_UNKNOWN,
             )
             self._active_preparation_generation = None
-            self._pending_start = False
             self._enabled = False
             self._set_state(self._idle_state())
             self._trace(
@@ -498,7 +539,7 @@ class MacroStateMachine:
         request: WorkerRequest,
         target_state: MacroState,
         *,
-        queue_on: bool = False,
+        before_activate: Callable[[], None] | None = None,
     ) -> bool:
         if self._worker is not None:
             return False
@@ -525,14 +566,16 @@ class MacroStateMachine:
                     request.mode, PreparationLifecycle.PREPARING
                 )
             self._set_state(target_state)
-            if queue_on:
-                self._audio.notify_on()
-                self._on_announced = True
+            if before_activate is not None:
+                before_activate()
             worker.activate()
         except BaseException as exc:
             release_error: BaseException | None = None
             try:
-                release_error = worker.cancel_and_release()
+                if request.kind is WorkerKind.PREPARATION:
+                    worker.cancel()
+                else:
+                    release_error = worker.cancel_and_release()
                 worker.activate()
             except BaseException as cleanup_exc:
                 release_error = cleanup_exc
@@ -561,7 +604,6 @@ class MacroStateMachine:
             self.selected_mode, PreparationLifecycle.IDLE_UNKNOWN
         )
         self._armed = False
-        self._pending_start = False
         if self._worker is not None:
             self._generation += 1
             self._preparation_invalidated = self.preparing
@@ -583,7 +625,6 @@ class MacroStateMachine:
             self.selected_mode, PreparationLifecycle.IDLE_UNKNOWN
         )
         self._armed = False
-        self._pending_start = False
         if self._deferred_release is None:
             self._deferred_release = threading.Event()
             self._deferred_discard = False
@@ -630,7 +671,6 @@ class MacroStateMachine:
         # Publish disabled before cancellation. A stale completion can never
         # observe an enabled controller and resurrect the macro.
         self._enabled = False
-        self._pending_start = False
         self._generation += 1
         self._off_pending = True
         self._macro_reload_invalidated = self.running
@@ -658,7 +698,6 @@ class MacroStateMachine:
         self._foreground_loss_latched = True
         was_enabled = self._enabled
         self._enabled = False
-        self._pending_start = False
         self._neutral_rearm_required = True
         self._armed = False
         self._generation += 1
@@ -696,7 +735,13 @@ class MacroStateMachine:
             self._preparation_invalidated = True
             self._magazines[self._worker_mode] = MagazineState.UNKNOWN
         self._set_state(MacroState.STOPPING)
-        release_error = worker.cancel_and_release()
+        if self._worker_kind is WorkerKind.PREPARATION:
+            # Preparation cancellation is event-only and never waits for its
+            # thread or the output lock. Completion remains generation-gated.
+            worker.cancel()
+            release_error = None
+        else:
+            release_error = worker.cancel_and_release()
         if release_error is not None:
             if self._worker_mode is not None:
                 self._magazines[self._worker_mode] = MagazineState.UNKNOWN
@@ -726,6 +771,19 @@ class MacroStateMachine:
 
     def _worker_stopped(self, event: ControlEvent) -> None:
         previous = self._snapshot()
+        retired = (
+            self._retired_preparations.pop(event.worker_token, None)
+            if event.worker_token is not None
+            else None
+        )
+        if retired is not None:
+            self._trace(
+                "OBSOLETE_PREPARATION_RESULT_IGNORED",
+                source=EventSource.WORKER,
+                previous=previous,
+                reason="immediate_start generation invalidation",
+            )
+            return
         if self._worker is None or event.worker_token != self._worker.token:
             self._trace(
                 "OBSOLETE_WORKER_RESULT_IGNORED",
@@ -799,11 +857,6 @@ class MacroStateMachine:
                     self._set_preparation_lifecycle(
                         mode, PreparationLifecycle.IDLE_UNKNOWN
                     )
-                if self._enabled and mode is self.selected_mode:
-                    self._enabled = False
-                    self._pending_start = False
-                    self._generation += 1
-                    self._off_pending = True
                 self._set_state(self._idle_state())
                 self._trace(
                     "PREPARATION_FAILED",
@@ -831,7 +884,6 @@ class MacroStateMachine:
                 self._armed = False
             if self._enabled:
                 self._enabled = False
-                self._pending_start = False
                 self._generation += 1
                 self._off_pending = True
             self._set_state(self._idle_state())
@@ -873,12 +925,6 @@ class MacroStateMachine:
             self._start_deferred_bypass()
             return
         if kind is WorkerKind.PREPARATION:
-            if preparation_succeeded and self._enabled and self._pending_start:
-                self._start_macro(
-                    EventSource.WORKER, "pending start after verified preparation"
-                )
-            elif not preparation_succeeded:
-                self._pending_start = False
             return
         if kind is WorkerKind.BYPASS:
             self._discard_deferred_bypass()
@@ -909,7 +955,6 @@ class MacroStateMachine:
         self._enabled = False
         self._generation += 1
         self._set_state(MacroState.SHUTTING_DOWN)
-        self._pending_start = False
         self._pending_selection = None
         self._neutral_rearm_required = True
         self._macro_reload_invalidated = True
@@ -925,15 +970,23 @@ class MacroStateMachine:
                     self._worker_mode,
                     PreparationLifecycle.IDLE_UNKNOWN,
                 )
-            release_error = worker.cancel_and_release()
+            if self._worker_kind is WorkerKind.PREPARATION:
+                worker.cancel()
+                release_error = None
+            else:
+                release_error = worker.cancel_and_release()
             if release_error is not None:
                 self._report(f"Generated-input release failed: {release_error}")
-            worker.join(2.0)
-            if worker.is_alive():
-                self._report("Worker did not exit within 2 seconds")
+            if self._worker_kind is not WorkerKind.PREPARATION:
+                worker.join(2.0)
+                if worker.is_alive():
+                    self._report("Worker did not exit within 2 seconds")
             self._worker = None
             self._worker_kind = None
             self._worker_mode = None
+        for retired_worker in self._retired_preparations.values():
+            retired_worker.cancel()
+        self._retired_preparations.clear()
         self._coordination.cleanup_completed()
         self._finish_off()
         self._trace(

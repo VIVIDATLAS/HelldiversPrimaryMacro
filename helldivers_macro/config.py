@@ -32,8 +32,12 @@ class ControlsConfig:
 @dataclass(frozen=True)
 class WeaponsConfig:
     reload_on_select: bool
-    reload_before_start_if_unknown: bool
     switch_settle_ms: int
+
+
+@dataclass(frozen=True)
+class BehaviorConfig:
+    start_policy: str
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,7 @@ class AppConfig:
     target: TargetConfig
     controls: ControlsConfig
     weapons: WeaponsConfig
+    behavior: BehaviorConfig
     diagnostics: DiagnosticsConfig
     audio: AudioConfig
     primary: PrimaryConfig
@@ -113,6 +118,7 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
     target_t = _table(data, "target")
     controls_t = _table(data, "controls")
     weapons_t = _table(data, "weapons")
+    behavior_t = _table(data, "behavior")
     diagnostics_t = _table(data, "diagnostics")
     audio_t = _table(data, "audio")
     audio_on_t = _table(audio_t, "on")
@@ -153,10 +159,12 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         reload_on_select=_value(
             weapons_t, "weapons", "reload_on_select", bool
         ),
-        reload_before_start_if_unknown=_value(
-            weapons_t, "weapons", "reload_before_start_if_unknown", bool
-        ),
         switch_settle_ms=_value(weapons_t, "weapons", "switch_settle_ms", int),
+    )
+    behavior = BehaviorConfig(
+        start_policy=_value(
+            behavior_t, "behavior", "start_policy", str
+        ).casefold(),
     )
     diagnostics = DiagnosticsConfig(
         ctrl_bypass_logging=_value(
@@ -204,7 +212,14 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         ),
     )
     config = AppConfig(
-        target, controls, weapons, diagnostics, audio, primary, secondary
+        target,
+        controls,
+        weapons,
+        behavior,
+        diagnostics,
+        audio,
+        primary,
+        secondary,
     )
     validate_config(config)
     return config
@@ -240,6 +255,8 @@ def validate_config(config: AppConfig) -> None:
     if config.controls.deferred_bypass_click_ms <= 0:
         raise ConfigError("controls.deferred_bypass_click_ms must be positive")
     _nonnegative("weapons.switch_settle_ms", config.weapons.switch_settle_ms)
+    if config.behavior.start_policy != "immediate":
+        raise ConfigError("behavior.start_policy supports only 'immediate'")
 
     for name, tone in (("audio.on", config.audio.on), ("audio.off", config.audio.off)):
         if not 37 <= tone.frequency_hz <= 32767:
