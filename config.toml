@@ -20,6 +20,7 @@ switch_settle_ms = 500
 
 [diagnostics]
 ctrl_bypass_logging = false
+state_tracing = false
 
 [audio.on]
 frequency_hz = 1000

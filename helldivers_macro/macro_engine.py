@@ -287,6 +287,7 @@ class MacroWorker:
         self._on_complete = on_complete
         self._on_progress = on_progress
         self.cancel_event = threading.Event()
+        self._activation = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name=f"{request.kind.name.lower()}-{request.mode.value.lower()}",
@@ -296,8 +297,12 @@ class MacroWorker:
     def start(self) -> None:
         self._thread.start()
 
+    def activate(self) -> None:
+        self._activation.set()
+
     def cancel_and_release(self) -> BaseException | None:
         self.cancel_event.set()
+        self._activation.set()
         try:
             with self._engine.io_lock:
                 self._engine.backend.release_all()
@@ -312,6 +317,12 @@ class MacroWorker:
         return self._thread.is_alive()
 
     def _run(self) -> None:
+        self._activation.wait()
+        if self.cancel_event.is_set() or self._shutdown.is_set():
+            self._on_complete(
+                self.token, WorkerResult(False, canceled=True)
+            )
+            return
         if self.request.kind is WorkerKind.MACRO:
             result = self._engine.run_macro(
                 self.mode,

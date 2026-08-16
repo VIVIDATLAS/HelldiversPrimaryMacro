@@ -15,6 +15,13 @@ class MagazineState(Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class PreparationLifecycle(Enum):
+    IDLE_UNKNOWN = auto()
+    PREPARING = auto()
+    IDLE_FULL_ARMED = auto()
+    PREPARATION_FAILED = auto()
+
+
 class Mb1PairDecision(Enum):
     SUPPRESS_TOGGLE = auto()
     PASS_THROUGH = auto()
@@ -35,8 +42,6 @@ class WorkerProgress(Enum):
 class MacroState(Enum):
     IDLE_PRIMARY = auto()
     IDLE_SECONDARY = auto()
-    WAITING_PRIMARY_RELEASE = auto()
-    WAITING_SECONDARY_RELEASE = auto()
     RUNNING_PRIMARY = auto()
     RUNNING_SECONDARY = auto()
     PREPARING_PRIMARY = auto()
@@ -55,8 +60,7 @@ class ControlEventKind(Enum):
     SELECT_PRIMARY = auto()
     SELECT_SECONDARY = auto()
     CTRL_DOWN = auto()
-    SHIFT_DOWN = auto()
-    RIGHT_DOWN = auto()
+    CTRL_UP = auto()
     FOREGROUND_LOST = auto()
     FOREGROUND_UNCERTAIN = auto()
     HOOK_FAILURE = auto()
@@ -66,11 +70,21 @@ class ControlEventKind(Enum):
     SHUTDOWN = auto()
 
 
+class EventSource(Enum):
+    PHYSICAL = "physical"
+    INJECTED_OWNED = "injected-owned"
+    INJECTED_BYPASS = "injected-bypass"
+    WORKER = "worker"
+    FOREGROUND = "foreground"
+    SHUTDOWN = "shutdown"
+
+
 @dataclass(frozen=True)
 class ControlEvent:
     kind: ControlEventKind
     detail: Any = None
     worker_token: int | None = None
+    source: EventSource = EventSource.PHYSICAL
 
 
 @dataclass(frozen=True)
@@ -80,6 +94,8 @@ class WorkerRequest:
     switch_settle_ms: int = 0
     bypass_release: Any = None
     bypass_click_ms: int = 0
+    preparation_generation: int = 0
+    generation: int = 0
 
 
 @dataclass(frozen=True)

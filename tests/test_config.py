@@ -32,6 +32,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.weapons.reload_before_start_if_unknown)
         self.assertEqual(config.weapons.switch_settle_ms, 500)
         self.assertFalse(config.diagnostics.ctrl_bypass_logging)
+        self.assertFalse(config.diagnostics.state_tracing)
 
     def test_empty_executable_is_rejected(self) -> None:
         raw = raw_config()
@@ -107,6 +108,7 @@ class ConfigTests(unittest.TestCase):
             "--check-config",
             "--dry-run-primary-cycle",
             "--dry-run-secondary-cycle",
+            "--simulate-session",
         )
         with patch.object(app, "WindowsHookThread", side_effect=forbidden), patch.object(
             app, "SendInputBackend", side_effect=forbidden

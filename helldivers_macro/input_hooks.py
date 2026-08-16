@@ -7,7 +7,7 @@ import threading
 from typing import Callable
 
 from .input_backend import INPUT_MARKER, ULONG_PTR, InputCoordination
-from .models import ControlEvent, ControlEventKind, Mb1PairDecision
+from .models import ControlEvent, ControlEventKind, EventSource, Mb1PairDecision
 
 
 WH_KEYBOARD_LL = 13
@@ -21,6 +21,7 @@ WM_SYSKEYUP = 0x0105
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205
 
 LLKHF_INJECTED = 0x10
 LLMHF_INJECTED = 0x01
@@ -28,6 +29,8 @@ LLMHF_LOWER_IL_INJECTED = 0x02
 
 VK_1 = 0x31
 VK_2 = 0x32
+VK_NUMPAD1 = 0x61
+VK_NUMPAD2 = 0x62
 VK_LSHIFT = 0xA0
 VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
@@ -101,8 +104,14 @@ class HookPolicy:
         else:
             self._keys_down.discard(vk_code)
 
-    def _emit(self, kind: ControlEventKind, detail: object = None) -> None:
-        self._event_sink(ControlEvent(kind, detail=detail))
+    def _emit(
+        self,
+        kind: ControlEventKind,
+        detail: object = None,
+        *,
+        source: EventSource = EventSource.PHYSICAL,
+    ) -> None:
+        self._event_sink(ControlEvent(kind, detail=detail, source=source))
 
     def _diagnostic(self, message: str) -> None:
         if self._diagnostics_enabled:
@@ -127,7 +136,9 @@ class HookPolicy:
                     )
                 self._emit(ControlEventKind.CTRL_DOWN)
             elif vk_code in (VK_LSHIFT, VK_RSHIFT):
-                self._emit(ControlEventKind.SHIFT_DOWN)
+                # Shift state is observed only to maintain a correct physical
+                # edge latch. It has no controller route or macro semantics.
+                pass
             elif vk_code in (VK_1, VK_2):
                 active, certain = self._foreground_status()
                 if active:
@@ -137,9 +148,15 @@ class HookPolicy:
                         else ControlEventKind.SELECT_SECONDARY
                     )
                 elif not certain:
-                    self._emit(ControlEventKind.FOREGROUND_UNCERTAIN)
+                    self._emit(
+                        ControlEventKind.FOREGROUND_UNCERTAIN,
+                        source=EventSource.FOREGROUND,
+                    )
         elif message in (WM_KEYUP, WM_SYSKEYUP):
+            was_down = vk_code in self._keys_down
             self._keys_down.discard(vk_code)
+            if was_down and vk_code in (VK_LCONTROL, VK_RCONTROL):
+                self._emit(ControlEventKind.CTRL_UP)
         return False
 
     def mouse(self, message: int, flags: int, extra_info: int) -> bool:
@@ -149,9 +166,6 @@ class HookPolicy:
         if marked or flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED):
             return False
 
-        if message == WM_RBUTTONDOWN:
-            self._emit(ControlEventKind.RIGHT_DOWN)
-            return False
         if message == WM_LBUTTONDOWN:
             if self._left_pair_decision is not None:
                 return self._left_pair_decision is not Mb1PairDecision.PASS_THROUGH
@@ -187,7 +201,8 @@ class HookPolicy:
                 self._emit(
                     ControlEventKind.FOREGROUND_LOST
                     if certain
-                    else ControlEventKind.FOREGROUND_UNCERTAIN
+                    else ControlEventKind.FOREGROUND_UNCERTAIN,
+                    source=EventSource.FOREGROUND,
                 )
             return decision is not Mb1PairDecision.PASS_THROUGH
         if message == WM_LBUTTONUP:
@@ -200,6 +215,10 @@ class HookPolicy:
             if decision is Mb1PairDecision.DEFERRED_BYPASS:
                 self._emit(ControlEventKind.DEFERRED_BYPASS_UP)
                 return True
+            # Passed-through physical releases remain visible as cleanup-only
+            # observations. This is required to clear neutral rearming after a
+            # focus change, and never authorizes a toggle in the controller.
+            self._emit(ControlEventKind.PHYSICAL_MB1_UP)
             return False
         return False
 
@@ -300,7 +319,13 @@ class WindowsHookThread:
             if self._policy.mouse(int(wparam), int(data.flags), int(data.dwExtraInfo)):
                 return 1
         except BaseException as exc:
-            self._event_sink(ControlEvent(ControlEventKind.HOOK_FAILURE, detail=exc))
+            self._event_sink(
+                ControlEvent(
+                    ControlEventKind.HOOK_FAILURE,
+                    detail=exc,
+                    source=EventSource.SHUTDOWN,
+                )
+            )
         return self._call_next(code, wparam, lparam)
 
     def _keyboard_proc(self, code: int, wparam: int, lparam: int) -> int:
@@ -310,7 +335,13 @@ class WindowsHookThread:
             data = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             self._policy.keyboard(int(wparam), int(data.vkCode), int(data.flags))
         except BaseException as exc:
-            self._event_sink(ControlEvent(ControlEventKind.HOOK_FAILURE, detail=exc))
+            self._event_sink(
+                ControlEvent(
+                    ControlEventKind.HOOK_FAILURE,
+                    detail=exc,
+                    source=EventSource.SHUTDOWN,
+                )
+            )
         return self._call_next(code, wparam, lparam)
 
     def start(self) -> None:
@@ -335,6 +366,7 @@ class WindowsHookThread:
                 ControlEvent(
                     ControlEventKind.HOOK_FAILURE,
                     detail=HookInstallError("hook thread did not stop"),
+                    source=EventSource.SHUTDOWN,
                 )
             )
 
@@ -406,5 +438,9 @@ class WindowsHookThread:
             self._ready.set()
             if unexpected_error is not None:
                 self._event_sink(
-                    ControlEvent(ControlEventKind.HOOK_FAILURE, detail=unexpected_error)
+                    ControlEvent(
+                        ControlEventKind.HOOK_FAILURE,
+                        detail=unexpected_error,
+                        source=EventSource.SHUTDOWN,
+                    )
                 )

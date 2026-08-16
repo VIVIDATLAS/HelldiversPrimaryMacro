@@ -24,6 +24,7 @@ from .models import (
     ControlEvent,
     ControlEventKind,
     CycleStep,
+    EventSource,
     OutputAction,
     WorkerProgress,
     WorkerRequest,
@@ -70,6 +71,7 @@ def _worker_factory(
                     ControlEventKind.WORKER_STOPPED,
                     detail=result,
                     worker_token=worker_token,
+                    source=EventSource.WORKER,
                 )
             )
 
@@ -79,6 +81,7 @@ def _worker_factory(
                     ControlEventKind.WORKER_PROGRESS,
                     detail=update,
                     worker_token=worker_token,
+                    source=EventSource.WORKER,
                 )
             )
 
@@ -106,6 +109,7 @@ def run_live(config: AppConfig) -> int:
         audio,
         _worker_factory(engine, shutdown_event, event_queue),
         coordination=coordination,
+        foreground_status=cache.status,
     )
 
     def inactive(uncertain: bool) -> None:
@@ -113,7 +117,8 @@ def run_live(config: AppConfig) -> int:
             ControlEvent(
                 ControlEventKind.FOREGROUND_UNCERTAIN
                 if uncertain
-                else ControlEventKind.FOREGROUND_LOST
+                else ControlEventKind.FOREGROUND_LOST,
+                source=EventSource.FOREGROUND,
             )
         )
 
@@ -213,11 +218,20 @@ def test_audio(config: AppConfig) -> int:
     notifier = AudioNotifier(config.audio)
     notifier.start()
     try:
+        print("Playing ON signal...")
         notifier.notify_on()
+        print("Playing OFF signal...")
         notifier.notify_off()
     finally:
-        notifier.stop(drain=True)
+        notifier.close(drain=True, raise_errors=True)
+    print("Audio test complete.")
     return 0
+
+
+def simulate_session(config: AppConfig) -> int:
+    from .simulation import run_simulated_session
+
+    return run_simulated_session(config)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -233,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--identify-foreground", action="store_true")
     modes.add_argument("--dry-run-primary-cycle", action="store_true")
     modes.add_argument("--dry-run-secondary-cycle", action="store_true")
+    modes.add_argument("--simulate-session", action="store_true")
     modes.add_argument("--test-audio", action="store_true")
     modes.add_argument("--live", action="store_true")
     parser.add_argument(
@@ -253,6 +268,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.identify_foreground,
             args.dry_run_primary_cycle,
             args.dry_run_secondary_cycle,
+            args.simulate_session,
             args.test_audio,
             args.live,
         )
@@ -273,6 +289,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run_secondary_cycle:
             print(_format_dry_run("SECONDARY", secondary_cycle_steps(config)))
             return 0
+        if args.simulate_session:
+            return simulate_session(config)
         if args.test_audio:
             return test_audio(config)
         if args.live:

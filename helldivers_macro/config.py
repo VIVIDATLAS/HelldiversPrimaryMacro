@@ -39,6 +39,7 @@ class WeaponsConfig:
 @dataclass(frozen=True)
 class DiagnosticsConfig:
     ctrl_bypass_logging: bool
+    state_tracing: bool
 
 
 @dataclass(frozen=True)
@@ -160,7 +161,10 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
     diagnostics = DiagnosticsConfig(
         ctrl_bypass_logging=_value(
             diagnostics_t, "diagnostics", "ctrl_bypass_logging", bool
-        )
+        ),
+        state_tracing=_value(
+            diagnostics_t, "diagnostics", "state_tracing", bool
+        ),
     )
     audio = AudioConfig(
         on=ToneConfig(

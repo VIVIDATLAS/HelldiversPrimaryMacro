@@ -11,11 +11,14 @@ from helldivers_macro.input_hooks import (
     VK_2,
     VK_LCONTROL,
     VK_LSHIFT,
+    VK_NUMPAD1,
+    VK_NUMPAD2,
     WM_KEYDOWN,
     WM_KEYUP,
     WM_LBUTTONDOWN,
     WM_LBUTTONUP,
     WM_RBUTTONDOWN,
+    WM_RBUTTONUP,
     validate_hook_layouts,
 )
 from helldivers_macro.models import ControlEventKind
@@ -47,7 +50,31 @@ class HookPolicyTests(unittest.TestCase):
     def test_number_two_selects_secondary_and_is_never_suppressed(self) -> None:
         policy = self.make_policy()
         self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_2, 0))
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_2, 0))
         self.assertEqual(self.kinds(), [ControlEventKind.SELECT_SECONDARY])
+
+    def test_key_up_resets_each_selection_edge_latch(self) -> None:
+        policy = self.make_policy()
+        for vk_code in (VK_1, VK_2):
+            policy.keyboard(WM_KEYDOWN, vk_code, 0)
+            policy.keyboard(WM_KEYUP, vk_code, 0)
+            policy.keyboard(WM_KEYDOWN, vk_code, 0)
+            policy.keyboard(WM_KEYUP, vk_code, 0)
+        self.assertEqual(
+            self.kinds(),
+            [
+                ControlEventKind.SELECT_PRIMARY,
+                ControlEventKind.SELECT_PRIMARY,
+                ControlEventKind.SELECT_SECONDARY,
+                ControlEventKind.SELECT_SECONDARY,
+            ],
+        )
+
+    def test_number_row_and_numpad_keys_are_distinct(self) -> None:
+        policy = self.make_policy()
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_NUMPAD1, 0))
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_NUMPAD2, 0))
+        self.assertEqual(self.events, [])
 
     def test_injected_keyboard_does_not_select_or_change_ctrl(self) -> None:
         policy = self.make_policy()
@@ -61,7 +88,13 @@ class HookPolicyTests(unittest.TestCase):
         policy.initialize_physical_key(VK_LCONTROL, True)
         self.assertFalse(policy.mouse(WM_LBUTTONDOWN, 0, 0))
         self.assertFalse(policy.mouse(WM_LBUTTONUP, 0, 0))
-        self.assertEqual(self.kinds(), [ControlEventKind.MANUAL_BYPASS_DOWN])
+        self.assertEqual(
+            self.kinds(),
+            [
+                ControlEventKind.MANUAL_BYPASS_DOWN,
+                ControlEventKind.PHYSICAL_MB1_UP,
+            ],
+        )
 
     def test_unmodified_target_mb1_pair_is_suppressed(self) -> None:
         policy = self.make_policy()
@@ -91,7 +124,11 @@ class HookPolicyTests(unittest.TestCase):
         self.assertFalse(policy.mouse(WM_LBUTTONUP, 0, 0))
         self.assertEqual(
             self.kinds(),
-            [ControlEventKind.CTRL_DOWN, ControlEventKind.MANUAL_BYPASS_DOWN],
+            [
+                ControlEventKind.CTRL_DOWN,
+                ControlEventKind.MANUAL_BYPASS_DOWN,
+                ControlEventKind.PHYSICAL_MB1_UP,
+            ],
         )
 
     def test_ctrl_state_is_visible_before_controller_queue_processing(self) -> None:
@@ -164,22 +201,31 @@ class HookPolicyTests(unittest.TestCase):
         self.assertFalse(policy.mouse(WM_LBUTTONDOWN, 0, 0))
         self.status = (True, True)
         self.assertFalse(policy.mouse(WM_LBUTTONUP, 0, 0))
-        self.assertEqual(self.kinds(), [ControlEventKind.FOREGROUND_LOST])
+        self.assertEqual(
+            self.kinds(),
+            [ControlEventKind.FOREGROUND_LOST, ControlEventKind.PHYSICAL_MB1_UP],
+        )
 
     def test_stale_foreground_passes_and_disarms(self) -> None:
         policy = self.make_policy((False, False))
         self.assertFalse(policy.mouse(WM_LBUTTONDOWN, 0, 0))
         self.assertFalse(policy.mouse(WM_LBUTTONUP, 0, 0))
-        self.assertEqual(self.kinds(), [ControlEventKind.FOREGROUND_UNCERTAIN])
-
-    def test_right_click_and_shift_emit_cancel_but_pass(self) -> None:
-        policy = self.make_policy()
-        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
-        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
         self.assertEqual(
             self.kinds(),
-            [ControlEventKind.RIGHT_DOWN, ControlEventKind.SHIFT_DOWN],
+            [
+                ControlEventKind.FOREGROUND_UNCERTAIN,
+                ControlEventKind.PHYSICAL_MB1_UP,
+            ],
         )
+
+    def test_right_click_and_shift_are_inert_and_pass(self) -> None:
+        policy = self.make_policy()
+        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
+        self.assertFalse(policy.keyboard(WM_KEYUP, VK_LSHIFT, 0))
+        self.assertEqual(self.kinds(), [])
 
     def test_diagnostics_ignore_unrelated_input(self) -> None:
         self.status = (True, True)

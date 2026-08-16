@@ -4,147 +4,131 @@ from pathlib import Path
 import unittest
 
 from helldivers_macro.config import load_config
-from helldivers_macro.models import (
-    ControlEvent,
-    ControlEventKind,
-    MagazineState,
-    MacroState,
-    WeaponMode,
-    WorkerKind,
-    WorkerRequest,
-    WorkerResult,
-)
-from helldivers_macro.state_machine import MacroStateMachine
+from helldivers_macro.input_hooks import VK_1, VK_2
+from helldivers_macro.models import MagazineState, MacroState, WeaponMode, WorkerKind, WorkerResult
+from helldivers_macro.simulation import FakeSessionWorker, SimulationHarness
 
 
 CONFIG = load_config(Path(__file__).resolve().parent.parent / "config.toml")
 
 
-class Audio:
-    def __init__(self) -> None:
-        self.events = []
-
-    def notify_on(self) -> None:
-        self.events.append("ON")
-
-    def notify_off(self) -> None:
-        self.events.append("OFF")
-
-
-class Worker:
-    def __init__(self, token: int, request: WorkerRequest) -> None:
-        self.token = token
-        self.request = request
-        self.canceled = 0
-        self.alive = True
-
-    def start(self) -> None:
-        pass
-
-    def cancel_and_release(self):
-        self.canceled += 1
-        return None
-
-    def join(self, timeout=None) -> None:
-        self.alive = False
-
-    def is_alive(self) -> bool:
-        return self.alive
-
-
-class Factory:
-    def __init__(self) -> None:
-        self.workers = []
-
-    def __call__(self, token, request):
-        worker = Worker(token, request)
-        self.workers.append(worker)
-        return worker
-
-
 class WeaponSelectionTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.audio = Audio()
-        self.factory = Factory()
-        self.messages = []
-        self.machine = MacroStateMachine(
+    def test_default_primary_same_mode_press_is_internal_noop(self) -> None:
+        h = SimulationHarness(CONFIG, trace=True)
+        before = (h.machine.state, h.machine.generation, len(h.workers), tuple(h.audio.events))
+        h.key_press(VK_1, repeats=5)
+        self.assertEqual(
+            before,
+            (h.machine.state, h.machine.generation, len(h.workers), tuple(h.audio.events)),
+        )
+        ignored = [r for r in h.reports if "SAME_MODE_SELECTION_IGNORED" in r]
+        self.assertEqual(len(ignored), 1)
+
+    def test_selecting_secondary_reloads_once_then_marks_full(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False)
+        h.key_press(VK_2, repeats=5)
+        self.assertIs(h.machine.selected_mode, WeaponMode.SECONDARY)
+        self.assertIs(h.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.FULL)
+        self.assertIs(h.machine.state, MacroState.IDLE_SECONDARY)
+        self.assertEqual([w.request.kind for w in h.workers], [WorkerKind.PREPARATION])
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in h.backend.events), 1
+        )
+        self.assertEqual(h.audio.events, [])
+
+    def test_same_mode_full_press_does_not_reload_again(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False)
+        h.make_full(WeaponMode.SECONDARY)
+        before = (
+            h.machine.generation,
+            len(h.workers),
+            len(h.backend.events),
+            h.machine.magazine_state(WeaponMode.SECONDARY),
+        )
+        h.key_press(VK_2)
+        self.assertEqual(
+            before,
+            (
+                h.machine.generation,
+                len(h.workers),
+                len(h.backend.events),
+                h.machine.magazine_state(WeaponMode.SECONDARY),
+            ),
+        )
+
+    def test_same_mode_during_preparation_preserves_generation_and_pending(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False, auto_complete_preparation=False)
+        h.key_press(VK_2)
+        worker = h.machine.worker
+        generation = h.machine.generation
+        h.click()
+        self.assertTrue(h.machine.pending_start)
+        h.key_press(VK_2, repeats=3)
+        self.assertIs(h.machine.worker, worker)
+        self.assertEqual(h.machine.generation, generation)
+        self.assertTrue(h.machine.pending_start)
+        self.assertEqual(len(h.workers), 1)
+
+    def test_same_mode_while_firing_does_not_stop_or_emit_audio(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False)
+        h.start(WeaponMode.SECONDARY)
+        before = (
+            h.machine.state,
+            h.machine.generation,
+            len(h.workers),
+            tuple(h.audio.events),
+            h.backend.mouse_owned,
+        )
+        h.key_press(VK_2, repeats=4)
+        self.assertEqual(
+            before,
+            (
+                h.machine.state,
+                h.machine.generation,
+                len(h.workers),
+                tuple(h.audio.events),
+                h.backend.mouse_owned,
+            ),
+        )
+        self.assertIs(h.machine.state, MacroState.RUNNING_SECONDARY)
+
+    def test_same_mode_while_stopping_is_noop(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False, auto_complete_cancel=False)
+        h.start(WeaponMode.SECONDARY)
+        macro = h.machine.worker
+        self.assertIsInstance(macro, FakeSessionWorker)
+        h.click()
+        self.assertIs(h.machine.state, MacroState.STOPPING)
+        before = (h.machine.generation, len(h.workers), tuple(h.audio.events))
+        h.key_press(VK_2, repeats=2)
+        self.assertEqual(before, (h.machine.generation, len(h.workers), tuple(h.audio.events)))
+        macro.finish(WorkerResult(False, canceled=True))
+        h.drain()
+        self.assertIs(h.machine.state, MacroState.IDLE_SECONDARY)
+
+    def test_other_weapon_selection_cancels_then_prepares_exactly_once(self) -> None:
+        h = SimulationHarness(
             CONFIG,
-            lambda: True,
-            self.audio,
-            self.factory,
-            reporter=self.messages.append,
+            trace=False,
+            auto_complete_preparation=True,
+            auto_complete_cancel=False,
         )
-
-    def send(self, kind) -> None:
-        self.machine.handle(ControlEvent(kind))
-
-    def complete(self, worker, result=WorkerResult(True)) -> None:
-        worker.alive = False
-        self.machine.handle(
-            ControlEvent(
-                ControlEventKind.WORKER_STOPPED,
-                detail=result,
-                worker_token=worker.token,
-            )
-        )
-
-    def test_number_one_reloads_then_marks_primary_full(self) -> None:
-        self.send(ControlEventKind.SELECT_PRIMARY)
-        prep = self.factory.workers[-1]
-        self.assertEqual(prep.request.kind, WorkerKind.PREPARATION)
-        self.assertEqual(prep.request.mode, WeaponMode.PRIMARY)
-        self.assertEqual(prep.request.switch_settle_ms, 500)
-        self.assertEqual(self.machine.state, MacroState.PREPARING_PRIMARY)
-        self.assertEqual(
-            self.machine.magazine_state(WeaponMode.PRIMARY), MagazineState.UNKNOWN
-        )
-        self.complete(prep)
-        self.assertEqual(
-            self.machine.magazine_state(WeaponMode.PRIMARY), MagazineState.FULL
-        )
-        self.assertTrue(self.machine.armed)
-        self.assertEqual(self.machine.state, MacroState.IDLE_PRIMARY)
-
-    def test_number_two_reloads_then_marks_secondary_full(self) -> None:
-        self.send(ControlEventKind.SELECT_SECONDARY)
-        prep = self.factory.workers[-1]
-        self.assertEqual(prep.request.mode, WeaponMode.SECONDARY)
-        self.assertEqual(self.machine.state, MacroState.PREPARING_SECONDARY)
-        self.complete(prep)
-        self.assertEqual(
-            self.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.FULL
-        )
-        self.assertEqual(self.machine.selected_mode, WeaponMode.SECONDARY)
-
-    def test_selection_never_starts_firing_or_plays_on(self) -> None:
-        self.send(ControlEventKind.SELECT_PRIMARY)
-        prep = self.factory.workers[-1]
-        self.complete(prep)
-        self.assertEqual(len(self.factory.workers), 1)
-        self.assertEqual(self.audio.events, [])
-
-    def test_switch_running_stops_once_then_prepares_new_weapon(self) -> None:
-        self.send(ControlEventKind.SELECT_PRIMARY)
-        prep = self.factory.workers[-1]
-        self.complete(prep)
-        self.send(ControlEventKind.PHYSICAL_MB1_DOWN)
-        self.send(ControlEventKind.PHYSICAL_MB1_UP)
-        macro = self.factory.workers[-1]
-        self.assertEqual(macro.request.kind, WorkerKind.MACRO)
-        self.send(ControlEventKind.SELECT_SECONDARY)
-        self.assertEqual(macro.canceled, 1)
-        self.assertEqual(self.machine.state, MacroState.STOPPING)
-        self.assertEqual(
-            self.machine.magazine_state(WeaponMode.SECONDARY), MagazineState.UNKNOWN
-        )
-        self.complete(macro, WorkerResult(False, canceled=True))
-        next_prep = self.factory.workers[-1]
-        self.assertEqual(next_prep.request.kind, WorkerKind.PREPARATION)
-        self.assertEqual(next_prep.request.mode, WeaponMode.SECONDARY)
-        self.assertEqual(self.audio.events, ["ON", "OFF"])
-        self.complete(next_prep)
-        self.assertEqual(self.audio.events, ["ON", "OFF"])
-        self.assertEqual(self.machine.state, MacroState.IDLE_SECONDARY)
+        h.start(WeaponMode.SECONDARY)
+        macro = h.machine.worker
+        self.assertIsInstance(macro, FakeSessionWorker)
+        h.key_press(VK_1)
+        self.assertFalse(h.machine.enabled)
+        self.assertIs(h.machine.state, MacroState.STOPPING)
+        self.assertEqual(h.audio.events, ["ON"])
+        macro.finish(WorkerResult(False, canceled=True))
+        h.drain()
+        preparations = [
+            w for w in h.workers if w.request.kind is WorkerKind.PREPARATION
+        ]
+        self.assertEqual(len([w for w in preparations if w.request.mode is WeaponMode.PRIMARY]), 1)
+        self.assertIs(h.machine.selected_mode, WeaponMode.PRIMARY)
+        self.assertIs(h.machine.magazine_state(WeaponMode.PRIMARY), MagazineState.FULL)
+        self.assertEqual(h.audio.events, ["ON", "OFF"])
 
 
 if __name__ == "__main__":
