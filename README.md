@@ -20,11 +20,60 @@ project does not provide a bypass or elevated-mode workaround.
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
 6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through S with fake hooks, input, foreground, time, workers,
+   scenarios A through V with fake hooks, input, foreground, time, workers,
    and audio only.
 7. Review both dry runs before deliberately choosing `--live`.
 
 Running `python main.py` without a mode prints help and does nothing.
+
+## Primary semi-automatic profile and calibration
+
+PRIMARY is a configurable 45-shot semi-automatic rifle profile. The weapon is
+capable of automatic fire, so configure it to semi-automatic manually in
+Helldivers before using this profile. The macro does not inspect or change the
+weapon's firing mode; it emits 45 independent MB1 click pairs.
+
+The initial primary configuration is:
+
+```toml
+[primary]
+shots_per_cycle = 45
+shot_period_ms = 120
+fire_press_ms = 35
+reload_press_ms = 25
+reload_wait_ms = 2600
+```
+
+`shot_period_ms` is authoritative. The MB1-up interval is derived as
+`shot_period_ms - fire_press_ms`, so the configured values produce 35 ms down
+and 85 ms up, exactly 120 ms from one generated MB1-down to the next. The AR-2
+Coyote's rated 600 RPM corresponds to `60000 / 600 = 100` ms per shot. The
+approved initial period gives `60000 / 120 = 500` RPM, providing a 20 ms margin
+above the theoretical minimum period. Lowering `primary.shot_period_ms`
+increases the firing speed.
+
+For later calibration, change only `primary.shot_period_ms` in `config.toml`,
+then run configuration validation and the primary dry run. Do not change the
+shot count, click-down time, or reload timing during firing-rate calibration.
+These rates are reference values only; only 120 ms is implemented initially:
+
+| Period | Rate |
+| -----: | ---: |
+| 120 ms | 500 RPM — initial setting |
+| 110 ms | approximately 545 RPM |
+| 105 ms | approximately 571 RPM |
+| 100 ms | 600 RPM — theoretical weapon limit |
+
+The tactical-reload cycle assumes a maximum loaded state of 46: start at 46,
+fire exactly 45 shots, leave one round chambered, reload, and return to 46. Do
+not configure 46 shots per cycle because firing the chambered round would empty
+the weapon and the next reload could return only 45.
+
+The user should manually establish 46 rounds before starting the synchronized
+cycle. If activation begins with only 45 rounds, the first cycle may empty the
+weapon and its reload may return only 45. Immediate activation still uses
+whatever ammunition is currently available. Ignored inputs, partial magazines,
+empty reserves, and interrupted reloads cannot be detected.
 
 ## Weapon selection and preparation
 
@@ -192,9 +241,11 @@ input failure, shutdown during a cycle, selection, or manual Ctrl+MB1 leaves it
 Immediate activation deliberately prioritizes latency over a guaranteed-full
 magazine. The first cycle uses whatever ammunition is currently available; it
 may dry-fire or fire fewer configured shots when the magazine is empty or
-partial. The macro becomes synchronized only after its first successful normal
-cycle reload completes. If a background preparation already issued `R`, firing
-is still scheduled and Helldivers decides whether the shot interrupts or is
+partial. PRIMARY's 46-round tactical state cannot be inferred from a completed
+reload: if activation started at 45 or below, firing may empty the weapon and
+the reload may return only 45. Establish 46 manually before enabling the
+synchronized cycle. If a background preparation already issued `R`, firing is
+still scheduled and Helldivers decides whether the shot interrupts or is
 delayed by its reload/weapon-switch animation. Immediate scheduling does not
 mean guaranteed ammunition or guaranteed immediate in-game response.
 
@@ -206,9 +257,11 @@ or bypass anti-cheat restrictions.
 
 ## Exact firing cycles
 
-PRIMARY repeats three charged shots: MB1 down 900 ms, up, wait 20 ms; MB1 down
-900 ms, up, wait 20 ms; MB1 down 900 ms, up, wait 300 ms; scan-code `R` down
-25 ms, up, then wait 2600 ms. The firing cycle is 5665 ms.
+PRIMARY repeats exactly 45 discrete clicks. Each is MB1 down 35 ms, up, then
+wait 85 ms, including after shot 45. Each MB1-down period is 120 ms, so the
+firing phase is `45 * 120 = 5400` ms. It then generates scan-code `R` down
+25 ms, up, waits 2600 ms, and repeats without replaying ON. The complete cycle
+is `5400 + 25 + 2600 = 8025` ms.
 
 SECONDARY repeats exactly 13 shots. Each is MB1 down 35 ms, up, then wait
 145 ms, including after shot 13. Each period is 180 ms. It then generates
@@ -256,10 +309,12 @@ Only `--live` installs hooks, suppresses paired physical MB1, or generates
 input. `--test-audio` plays only the configured tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through S and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+A through V and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
 the existing controller regressions plus immediate UNKNOWN start, switch-settle
 preemption, active-reload preemption, immediate stop, and first-cycle reload
-synchronization all pass.
+synchronization all pass. Scenarios T, U, and V respectively verify the exact
+45-shot tactical cycle, six primary cancellation positions, and the unchanged
+13-shot/4,365 ms secondary cycle.
 
 The complete non-live validation set is:
 

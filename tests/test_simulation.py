@@ -57,7 +57,7 @@ class SimulatedSessionTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         text = output.getvalue()
-        for label in "ABCDEFGHIJKLMNOPQRS":
+        for label in "ABCDEFGHIJKLMNOPQRSTUV":
             self.assertIn(f"SCENARIO {label}: PASS", text)
         self.assertIn("DETERMINISTIC CONTROL SIMULATION: PASS", text)
 

@@ -33,10 +33,9 @@ frequency_hz = 500
 duration_ms = 150
 
 [primary]
-shots_per_cycle = 3
-fire_hold_ms = 900
-inter_shot_ms = 20
-post_last_shot_ms = 300
+shots_per_cycle = 45
+shot_period_ms = 120
+fire_press_ms = 35
 reload_press_ms = 25
 reload_wait_ms = 2600
 

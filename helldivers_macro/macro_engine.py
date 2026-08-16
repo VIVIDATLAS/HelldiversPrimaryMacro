@@ -32,19 +32,18 @@ class GeneratedInput(Protocol):
 def primary_cycle_steps(config: AppConfig) -> list[CycleStep]:
     steps: list[CycleStep] = []
     primary = config.primary
-    for shot in range(primary.shots_per_cycle):
+    between_ms = primary.shot_period_ms - primary.fire_press_ms
+    for _ in range(primary.shots_per_cycle):
         steps.extend(
             [
                 CycleStep(OutputAction.MB1_DOWN),
-                CycleStep(OutputAction.WAIT, primary.fire_hold_ms),
+                CycleStep(OutputAction.WAIT, primary.fire_press_ms),
                 CycleStep(OutputAction.MB1_UP),
+                CycleStep(OutputAction.WAIT, between_ms),
             ]
         )
-        if shot < primary.shots_per_cycle - 1:
-            steps.append(CycleStep(OutputAction.WAIT, primary.inter_shot_ms))
     steps.extend(
         [
-            CycleStep(OutputAction.WAIT, primary.post_last_shot_ms),
             CycleStep(OutputAction.R_DOWN),
             CycleStep(OutputAction.WAIT, primary.reload_press_ms),
             CycleStep(OutputAction.R_UP),

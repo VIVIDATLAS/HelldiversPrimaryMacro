@@ -78,14 +78,29 @@ class FakeAudioNotifier:
 
 
 class FakeGeneratedInput:
-    def __init__(self, state_probe: Callable[[], str]) -> None:
+    def __init__(
+        self,
+        state_probe: Callable[[], str],
+        clock: Callable[[], float] = lambda: 0.0,
+    ) -> None:
         self._state_probe = state_probe
+        self._clock = clock
         self.events: list[tuple[str, str]] = []
+        self.timed_events: list[tuple[str, int]] = []
+        self.tagged_events: list[tuple[str, EventSource]] = []
         self.mouse_owned = False
         self.reload_owned = False
 
     def _record(self, name: str) -> None:
-        self.events.append((name, self._state_probe()))
+        state = self._state_probe()
+        self.events.append((name, state))
+        self.timed_events.append((name, round(self._clock() * 1000)))
+        source = (
+            EventSource.INJECTED_BYPASS
+            if state == MacroState.FORWARDING_BYPASS.name
+            else EventSource.INJECTED_OWNED
+        )
+        self.tagged_events.append((name, source))
 
     def mouse_owned_snapshot(self) -> bool:
         return self.mouse_owned
@@ -287,7 +302,8 @@ class SimulationHarness:
         self.workers: list[FakeSessionWorker] = []
         holder: list[MacroStateMachine] = []
         self.backend = FakeGeneratedInput(
-            lambda: holder[0].state.name if holder else "UNINITIALIZED"
+            lambda: holder[0].state.name if holder else "UNINITIALIZED",
+            self.clock,
         )
         self.engine = MacroEngine(
             self.config,
@@ -892,6 +908,136 @@ def _scenario_s(config: AppConfig) -> str:
     return "first cycle reload synchronized FULL before the next cycle began"
 
 
+def _scenario_t(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=False)
+    started_at = round(h.clock() * 1000)
+    assert h.click() == (True, True)
+    assert h.audio.events == ["ON"]
+    macro = h.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    macro.complete_cycle_reload()
+    h.drain()
+
+    cycle_events = [
+        (name, at - started_at) for name, at in h.backend.timed_events
+    ]
+    names = [name for name, _at in cycle_events]
+    assert names == ["MB1_DOWN", "MB1_UP"] * 45 + ["R_DOWN", "R_UP"]
+    assert all(
+        source is EventSource.INJECTED_OWNED
+        for _name, source in h.backend.tagged_events
+    )
+    assert h.hook_events.count(ControlEventKind.PHYSICAL_MB1_DOWN) == 1
+    assert h.hook_events.count(ControlEventKind.PHYSICAL_MB1_UP) == 1
+    downs = [at for name, at in cycle_events if name == "MB1_DOWN"]
+    ups = [at for name, at in cycle_events if name == "MB1_UP"]
+    assert len(downs) == len(ups) == 45
+    assert [up - down for down, up in zip(downs, ups)] == [35] * 45
+    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [120] * 44
+    assert [next_down - up for up, next_down in zip(ups, downs[1:])] == [85] * 44
+    assert cycle_events[-2:] == [("R_DOWN", 5400), ("R_UP", 5425)]
+    assert cycle_events[-2][1] - ups[-1] == 85
+    assert round(h.clock() * 1000) - started_at == 8025
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.FULL
+    assert h.machine.enabled and h.audio.events == ["ON"]
+
+    macro.begin_next_cycle()
+    h.drain()
+    assert h.backend.timed_events[-1] == ("MB1_DOWN", started_at + 8025)
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
+    assert h.audio.events == ["ON"]
+    return "PRIMARY completed 45 tactical clicks, reloaded FULL, and repeated"
+
+
+def _run_primary_cancellation(
+    config: AppConfig, cancel_at_ms: int
+) -> tuple[FakeGeneratedInput, WorkerResult, tuple[WorkerProgress, ...]]:
+    clock = FakeClock()
+    started_at = clock()
+    backend = FakeGeneratedInput(lambda: "RUNNING_PRIMARY", clock)
+    cancel = threading.Event()
+    progress: list[WorkerProgress] = []
+
+    def wait(event: threading.Event, seconds: float) -> bool:
+        result = clock.wait(event, seconds)
+        if round((clock() - started_at) * 1000) >= cancel_at_ms:
+            cancel.set()
+        return result
+
+    engine = MacroEngine(
+        config,
+        backend,
+        lambda: True,
+        clock=clock,
+        wait=wait,
+    )
+    result = engine.run_macro(
+        WeaponMode.PRIMARY,
+        cancel,
+        threading.Event(),
+        progress.append,
+    )
+    return backend, result, tuple(progress)
+
+
+def _scenario_u(config: AppConfig) -> str:
+    cases = (
+        ("shot 1 down", 5, 1, False),
+        ("shot 20 up interval", 2320, 20, False),
+        ("after shot 44", 5275, 44, False),
+        ("final post-shot interval", 5350, 45, False),
+        ("R-down", 5405, 45, True),
+        ("reload wait", 5430, 45, True),
+    )
+    for label, cancel_at, expected_shots, expect_reload in cases:
+        backend, result, progress = _run_primary_cancellation(config, cancel_at)
+        names = [name for name, _state in backend.events]
+        assert result.canceled, label
+        assert names.count("MB1_DOWN") == expected_shots, label
+        assert names.count("MB1_UP") == expected_shots, label
+        assert ("R_DOWN" in names) is expect_reload, label
+        assert ("R_UP" in names) is expect_reload, label
+        assert WorkerProgress.RELOAD_COMPLETE not in progress, label
+        assert not backend.mouse_owned and not backend.reload_owned, label
+    return "PRIMARY cancellation cleaned input at six firing/reload positions"
+
+
+def _scenario_v(config: AppConfig) -> str:
+    clock = FakeClock()
+    started_at = clock()
+    backend = FakeGeneratedInput(lambda: "RUNNING_SECONDARY", clock)
+    cancel = threading.Event()
+    progress: list[tuple[WorkerProgress, int]] = []
+
+    def report(update: WorkerProgress) -> None:
+        elapsed = round((clock() - started_at) * 1000)
+        progress.append((update, elapsed))
+        if update is WorkerProgress.RELOAD_COMPLETE:
+            cancel.set()
+
+    result = MacroEngine(
+        config,
+        backend,
+        lambda: True,
+        clock=clock,
+        wait=clock.wait,
+    ).run_macro(WeaponMode.SECONDARY, cancel, threading.Event(), report)
+    names = [name for name, _state in backend.events]
+    times = [
+        (name, at - round(started_at * 1000))
+        for name, at in backend.timed_events
+    ]
+    downs = [at for name, at in times if name == "MB1_DOWN"]
+    ups = [at for name, at in times if name == "MB1_UP"]
+    assert result.canceled
+    assert names == ["MB1_DOWN", "MB1_UP"] * 13 + ["R_DOWN", "R_UP"]
+    assert [up - down for down, up in zip(downs, ups)] == [35] * 13
+    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [180] * 12
+    assert times[-2:] == [("R_DOWN", 2340), ("R_UP", 2365)]
+    assert progress[-1] == (WorkerProgress.RELOAD_COMPLETE, 4365)
+    return "SECONDARY retained its exact 13-shot 4,365 ms cycle"
+
+
 _SCENARIOS = (
     ("A", _scenario_a),
     ("B", _scenario_b),
@@ -912,6 +1058,9 @@ _SCENARIOS = (
     ("Q", _scenario_q),
     ("R", _scenario_r),
     ("S", _scenario_s),
+    ("T", _scenario_t),
+    ("U", _scenario_u),
+    ("V", _scenario_v),
 )
 
 

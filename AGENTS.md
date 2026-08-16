@@ -13,6 +13,16 @@ deferred-bypass transitions. Audio notifications have their own queue/thread.
 `simulation.py` provides deterministic end-to-end sessions using only fake OS
 boundaries, input, clock/waiting, workers, and audio.
 
+PRIMARY is a configurable 45-shot semi-automatic rifle profile. Helldivers must
+be configured to semi-automatic manually; the macro does not change firing
+mode. Its approved initial cadence is a 120 ms period (500 RPM) with MB1 down
+for 35 ms and the derived up interval of 85 ms. The tactical-reload strategy
+assumes the user manually starts with 46 rounds, fires 45, leaves one chambered,
+and reloads back to 46. Immediate first activation can begin from an unknown or
+partial magazine because ammunition, ignored inputs, empty reserves, and
+interrupted reloads are not observable. During later rate calibration, change
+only `primary.shot_period_ms` in `config.toml`.
+
 Never read or depend on Lua, Logitech G HUB, AutoHotkey, drivers, game memory,
 injection, interception, hardware emulation, anti-cheat workarounds, network
 traffic, third-party packages, or administrator access. Only `--live` may
@@ -44,6 +54,6 @@ accepted tones and exposes worker failures; all owned MB1/R downs are released
 on every exit; MB1-down is the only toggle edge and MB1-up is cleanup-only;
 same-mode selection, MB2, and Shift cannot mutate controller state; Ctrl cannot
 restart canceled work; foreground regain requires neutral physical input and
-never auto-restarts; scenarios A-S and all authorized validation commands pass.
+never auto-restarts; scenarios A-V and all authorized validation commands pass.
 Ctrl-bypass and state-trace diagnostics default off and never log unrelated
 input; trace reasons are transition-local and include elapsed milliseconds.

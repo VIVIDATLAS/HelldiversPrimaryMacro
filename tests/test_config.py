@@ -25,8 +25,16 @@ class ConfigTests(unittest.TestCase):
     def test_default_config_loads(self) -> None:
         config = load_config(ROOT / "config.toml")
         self.assertEqual(config.target.executable, "helldivers2.exe")
-        self.assertEqual(config.primary.shots_per_cycle, 3)
+        self.assertEqual(config.primary.shots_per_cycle, 45)
+        self.assertEqual(config.primary.fire_press_ms, 35)
+        self.assertEqual(config.primary.shot_period_ms, 120)
+        self.assertEqual(config.primary.reload_press_ms, 25)
+        self.assertEqual(config.primary.reload_wait_ms, 2600)
         self.assertEqual(config.secondary.shots_per_cycle, 13)
+        self.assertEqual(config.secondary.fire_press_ms, 35)
+        self.assertEqual(config.secondary.shot_period_ms, 180)
+        self.assertEqual(config.secondary.reload_press_ms, 25)
+        self.assertEqual(config.secondary.reload_wait_ms, 2000)
         self.assertEqual(config.controls.deferred_bypass_click_ms, 20)
         self.assertTrue(config.weapons.reload_on_select)
         self.assertEqual(config.weapons.switch_settle_ms, 500)
@@ -64,8 +72,14 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "must not exceed"):
             parse_config(raw)
 
+    def test_primary_press_cannot_exceed_period(self) -> None:
+        raw = raw_config()
+        raw["primary"]["fire_press_ms"] = 121
+        with self.assertRaisesRegex(ConfigError, "must not exceed"):
+            parse_config(raw)
+
     def test_exact_shot_counts_are_enforced(self) -> None:
-        for section, count in (("primary", 4), ("secondary", 12)):
+        for section, count in (("primary", 46), ("secondary", 12)):
             with self.subTest(section=section):
                 raw = copy.deepcopy(raw_config())
                 raw[section]["shots_per_cycle"] = count
@@ -124,6 +138,17 @@ class ConfigTests(unittest.TestCase):
                     self.assertEqual(
                         app.main([mode, "--config", str(ROOT / "config.toml")]), 0
                     )
+
+    def test_primary_and_secondary_dry_run_durations(self) -> None:
+        for mode, duration in (
+            ("--dry-run-primary-cycle", 8025),
+            ("--dry-run-secondary-cycle", 4365),
+        ):
+            with self.subTest(mode=mode), redirect_stdout(StringIO()) as output:
+                self.assertEqual(
+                    app.main([mode, "--config", str(ROOT / "config.toml")]), 0
+                )
+            self.assertIn(f"Cycle duration: {duration} ms", output.getvalue())
 
     def test_foreground_diagnostic_is_inspection_only(self) -> None:
         class Inspector:

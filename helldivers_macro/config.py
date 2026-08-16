@@ -61,9 +61,8 @@ class AudioConfig:
 @dataclass(frozen=True)
 class PrimaryConfig:
     shots_per_cycle: int
-    fire_hold_ms: int
-    inter_shot_ms: int
-    post_last_shot_ms: int
+    shot_period_ms: int
+    fire_press_ms: int
     reload_press_ms: int
     reload_wait_ms: int
 
@@ -186,10 +185,11 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
     )
     primary = PrimaryConfig(
         shots_per_cycle=_value(primary_t, "primary", "shots_per_cycle", int),
-        fire_hold_ms=_value(primary_t, "primary", "fire_hold_ms", int),
-        inter_shot_ms=_value(primary_t, "primary", "inter_shot_ms", int),
-        post_last_shot_ms=_value(
-            primary_t, "primary", "post_last_shot_ms", int
+        shot_period_ms=_value(
+            primary_t, "primary", "shot_period_ms", int
+        ),
+        fire_press_ms=_value(
+            primary_t, "primary", "fire_press_ms", int
         ),
         reload_press_ms=_value(primary_t, "primary", "reload_press_ms", int),
         reload_wait_ms=_value(primary_t, "primary", "reload_wait_ms", int),
@@ -265,14 +265,13 @@ def validate_config(config: AppConfig) -> None:
             )
         _nonnegative(f"{name}.duration_ms", tone.duration_ms)
 
-    if config.primary.shots_per_cycle != 3:
-        raise ConfigError("primary.shots_per_cycle must be exactly 3")
+    if config.primary.shots_per_cycle != 45:
+        raise ConfigError("primary.shots_per_cycle must be exactly 45")
     if config.secondary.shots_per_cycle != 13:
         raise ConfigError("secondary.shots_per_cycle must be exactly 13")
     for name, value in (
-        ("primary.fire_hold_ms", config.primary.fire_hold_ms),
-        ("primary.inter_shot_ms", config.primary.inter_shot_ms),
-        ("primary.post_last_shot_ms", config.primary.post_last_shot_ms),
+        ("primary.shot_period_ms", config.primary.shot_period_ms),
+        ("primary.fire_press_ms", config.primary.fire_press_ms),
         ("primary.reload_press_ms", config.primary.reload_press_ms),
         ("primary.reload_wait_ms", config.primary.reload_wait_ms),
         ("secondary.shot_period_ms", config.secondary.shot_period_ms),
@@ -283,6 +282,10 @@ def validate_config(config: AppConfig) -> None:
         _nonnegative(name, value)
     if config.primary.shots_per_cycle <= 0 or config.secondary.shots_per_cycle <= 0:
         raise ConfigError("shot counts must be positive")
+    if config.primary.fire_press_ms > config.primary.shot_period_ms:
+        raise ConfigError(
+            "primary.fire_press_ms must not exceed primary.shot_period_ms"
+        )
     if config.secondary.fire_press_ms > config.secondary.shot_period_ms:
         raise ConfigError(
             "secondary.fire_press_ms must not exceed secondary.shot_period_ms"

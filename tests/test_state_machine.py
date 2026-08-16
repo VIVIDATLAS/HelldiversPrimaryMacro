@@ -226,6 +226,34 @@ class StateMachineTests(unittest.TestCase):
         self.assertFalse(h.backend.mouse_owned)
         self.assertFalse(any(w.request.kind is WorkerKind.PREPARATION for w in h.workers[2:]))
 
+    def test_stale_primary_completion_cannot_restart_macro(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False, auto_complete_cancel=False)
+        h.start(WeaponMode.PRIMARY)
+        macro = h.machine.worker
+        self.assertIsInstance(macro, FakeSessionWorker)
+        macro_count = len(
+            [worker for worker in h.workers if worker.request.kind is WorkerKind.MACRO]
+        )
+        h.policy.keyboard(WM_KEYDOWN, VK_LCONTROL, 0)
+        h.drain()
+        self.assertFalse(h.machine.enabled)
+        macro.finish(WorkerResult(False, canceled=True))
+        h.drain()
+        self.assertFalse(h.machine.enabled)
+        self.assertFalse(h.machine.firing)
+        self.assertIsNone(h.machine.worker)
+        self.assertEqual(
+            len(
+                [
+                    worker
+                    for worker in h.workers
+                    if worker.request.kind is WorkerKind.MACRO
+                ]
+            ),
+            macro_count,
+        )
+        self.assertEqual(h.audio.events, ["ON", "OFF"])
+
     def test_ctrl_when_disabled_does_not_mutate_controller(self) -> None:
         h = SimulationHarness(CONFIG, trace=False)
         before = (
