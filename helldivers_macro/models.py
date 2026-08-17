@@ -35,11 +35,17 @@ class Mb1PairDecision(Enum):
     DEFERRED_BYPASS = auto()
 
 
+class Mb2PairDecision(Enum):
+    PASS_THROUGH = auto()
+    DEFERRED_AIM_OFF = auto()
+
+
 class WorkerKind(Enum):
     MACRO = auto()
     PREPARATION = auto()
     RELOAD_ONLY = auto()
     SHIFT_TRANSACTION = auto()
+    AIM_OFF_TRANSACTION = auto()
     BYPASS = auto()
 
 
@@ -53,6 +59,8 @@ class WorkerProgress(Enum):
     RELOAD_COMPLETED = auto()
     RELOAD_FAILED = auto()
     AIM_OFF_SENT = auto()
+    AIM_OFF_REPLAY_DOWN = auto()
+    AIM_OFF_REPLAY_UP = auto()
     SHIFT_REPLAY_DOWN = auto()
     SHIFT_REPLAY_UP = auto()
     # Compatibility alias for existing callers while trace output uses the
@@ -86,6 +94,7 @@ class ControlEventKind(Enum):
     PHYSICAL_MB1_UP = auto()
     PHYSICAL_MB2_DOWN = auto()
     PHYSICAL_MB2_UP = auto()
+    DEFERRED_AIM_OFF = auto()
     MANUAL_BYPASS_DOWN = auto()
     DEFERRED_BYPASS_DOWN = auto()
     DEFERRED_BYPASS_UP = auto()
@@ -95,6 +104,7 @@ class ControlEventKind(Enum):
     CTRL_UP = auto()
     SHIFT_DOWN = auto()
     SHIFT_UP = auto()
+    FOREGROUND_ACTIVE = auto()
     FOREGROUND_LOST = auto()
     FOREGROUND_UNCERTAIN = auto()
     HOOK_FAILURE = auto()
@@ -140,6 +150,7 @@ class WorkerRequest:
     shift_scan_code: int = 0
     cancel_aim: bool = False
     native_aim_cancel: bool = False
+    normalize_unknown_aim: bool = False
 
 
 @dataclass(frozen=True)

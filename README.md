@@ -20,7 +20,7 @@ project does not provide a bypass or elevated-mode workaround.
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
 6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through AJ with fake hooks, input, foreground, time, workers,
+   scenarios A through AT with fake hooks, input, foreground, time, workers,
    and audio only.
 7. Review both dry runs before deliberately choosing `--live`.
 
@@ -87,7 +87,7 @@ requested weapon, mark it
 wait the complete weapon-specific reload time, then mark it `FULL` and arm it
 only if every operation and foreground check succeeded.
 
-Selection preparation is background work. An accepted MB1-down always wins: it
+Selection preparation is background work. An aimed, accepted MB1-down always wins: it
 cancels and invalidates unfinished switch-settle/reload preparation without
 joining or waiting for that worker, then schedules firing immediately. If
 preparation completed and was reconciled first, the magazine may be `FULL`;
@@ -108,17 +108,23 @@ and cannot leave the controller stuck in `PREPARING`.
 game-specific constant. Increase it if reload occurs before the selected weapon
 is ready. Selection never starts firing automatically.
 
-## Immediate MB1 down-edge toggle
+## Aim-required immediate MB1 down-edge toggle
 
 An unmodified physical MB1 pair beginning while Helldivers is freshly confirmed
-foreground is suppressed. Its accepted physical down edge toggles the selected
-macro immediately. MB1-up is cleanup-only: it clears physical/pair state and
+foreground is suppressed. Its physical down edge can enable the selected macro
+only while the inferred aim state is exactly `AIM_ON`. `AIM_OFF` and `UNKNOWN`
+are rejected with `AIM_REQUIRED`: no worker, generated MB1, ON/OFF audio, or
+reload is created. MB1-up is cleanup-only: it clears physical/pair state and
 never starts, rejects, toggles, prepares, changes weapons, or emits audio. On
-the accepted down edge the controller sets `enabled`, queues ON, invalidates
+an aimed accepted down edge the controller sets `enabled`, queues ON, invalidates
 and nonblockingly cancels any background preparation, publishes
 `RUNNING_PRIMARY` or `RUNNING_SECONDARY`, and activates generated firing in the
 same controller reconciliation. It does not wait for MB1-up, switch settle,
 reload input, reload completion, or preparation-thread exit.
+
+The controller continuously preserves `enabled or firing -> AIM_ON`. A known
+aim-off transition disables current firing; foreground loss makes aim
+`UNKNOWN`, cancels pending output, and also disables firing.
 
 The configured policy is explicit:
 
@@ -128,9 +134,9 @@ start_policy = "immediate"
 ```
 
 Only `immediate` is supported. Deterministic fake-clock tests schedule the first
-generated MB1-down at 0 ms; the application-controlled target is at most 50 ms
-from accepted physical MB1-down. Windows scheduling and the game are outside
-that measurement.
+generated MB1-down at 0 ms after an aimed accepted edge; the
+application-controlled target is at most 50 ms from accepted physical MB1-down.
+Windows scheduling and the game are outside that measurement.
 
 If the weapon is `FULL`, firing starts without an unnecessary reload. A later
 accepted MB1-down disables and starts cleanup. Its matching up remains paired
@@ -153,6 +159,10 @@ The keyboard hook records physical Left/Right Ctrl synchronously before it
 queues the higher-level cancellation event. If Ctrl is held, generated MB1 is
 not owned, and cleanup is complete, the complete physical MB1 pair passes
 through normally and never toggles the macro.
+
+Ctrl+MB1 is the explicit normal-click bypass for menus and manual interaction.
+The aim-required firing gate applies only to unmodified MB1 macro activation;
+the bypass never enables a worker or plays ON/OFF audio.
 
 If a rapid Ctrl+MB1 begins while generated MB1 is still down or cancellation
 cleanup is pending, the complete physical pair is suppressed and deferred.
@@ -177,12 +187,34 @@ generation, and cannot enter preparation or restore
 distinct unmodified MB1-down is required. Ctrl alone is state-neutral while
 the macro is disabled. Ctrl+MB1 always marks the selected magazine `UNKNOWN`.
 
-Physical MB2 is the game's toggle-aim input. Every down/up passes through
-unchanged and is never suppressed or replayed. A foreground physical MB2-down
-updates a conservative assumed state from `AIM_OFF` to `AIM_ON`, or from
-`AIM_ON` to `AIM_OFF`; MB2-up is edge cleanup only. This tracking never enables,
-disables, starts, stops, reloads, or emits macro audio. Tagged/generated and
-other injected MB2 events are ignored by the hook.
+Physical MB2 is the game's toggle-aim input. While the macro is not actively
+shooting, each physical pair passes through unchanged. Its first foreground
+down edge updates a conservative assumed state from `AIM_OFF` to `AIM_ON`, or
+from `AIM_ON` to `AIM_OFF`; repeat downs do not toggle repeatedly and MB2-up is
+edge cleanup only. After genuine foreground loss, one new untagged physical
+RMB-down explicitly resynchronizes `UNKNOWN -> AIM_ON`; the next RMB-down uses
+the normal `AIM_ON -> AIM_OFF` transition. Idle RMB never enables the macro, emits audio, generates
+Shift/R, or restarts firing. Tagged/generated and other injected MB2 events are
+ignored by the hook.
+
+During published active firing, the hook instead pair-latches and suppresses
+one physical RMB down/up pair, including repeats, and queues one controller
+transaction. The generated order is:
+
+```text
+MACRO_DISABLED
+owned MB1-up, if the shot was down
+FIRING_STOPPED / OFF once
+owned MB2-down
+owned MB2-up
+AIM_OFF
+```
+
+This guarantees firing stops before Helldivers receives the captured aim-off
+toggle. The transaction never generates Shift or `R`, and a later physical RMB
+aim-on does not restart the macro; an aimed MB1 is required. If an ordinary
+reload had already begun, RMB passes normally, disables future firing, and
+allows that existing reload to finish without a duplicate `R`.
 
 Physical Left and Right Shift are the game's toggle-sprint inputs. While the
 target is confirmed foreground, the hook pair-latches and suppresses one
@@ -222,10 +254,12 @@ obsolete pending work; failures leave the inferred state conservative and are
 never retried blindly.
 
 Sprint is a persistent game-side toggle. After the one replayed Shift pair,
-physical RMB continues to pass through normally. Toggling aim ON and then OFF
-does not generate another Shift, reload, or macro transition; Helldivers is
-responsible for resuming persistent sprint. A second deliberate physical Shift
-creates exactly one second replay pair so the game can toggle sprint OFF.
+physical RMB continues to pass normally while firing is disabled. Toggling aim
+ON and then OFF does not generate another Shift or reload; Helldivers is
+responsible for resuming persistent sprint. If firing is started between those
+RMB edges, the RMB-off transaction above stops it before replaying aim-off, but
+still emits no Shift or reload. A second deliberate physical Shift creates
+exactly one second replay pair so the game can toggle sprint OFF.
 
 If Helldivers itself cancels toggle aim when Shift begins sprinting, set:
 
@@ -268,6 +302,13 @@ Deferred sprint tracing is limited to low-volume transitions including
 `AIM_OFF_SENT`, `AIM_OFF_SKIPPED`, `SHIFT_REPLAY_DOWN`, `SHIFT_REPLAY_UP`,
 `SHIFT_TRANSACTION_COMPLETED`, and `SHIFT_TRANSACTION_FAILED`.
 
+Aim gating and deferred firing-RMB tracing is likewise low-volume:
+`AIM_REQUIRED_REJECTED`, `AIM_OFF_DEFERRED`,
+`AIM_OFF_TRANSACTION_STARTED`, `AIM_OFF_FIRING_STOPPED`,
+`AIM_OFF_REPLAY_DOWN`, `AIM_OFF_REPLAY_UP`,
+`AIM_OFF_TRANSACTION_COMPLETED`, `AIM_OFF_TRANSACTION_FAILED`,
+`AIM_UNKNOWN_RESYNCED_ON`, and `AIM_UNKNOWN_NORMALIZED_OFF`.
+
 Reload diagnostics use transition-local worker phases `FINAL_SHOT_DOWN`,
 `FINAL_SHOT_UP`, `RELOAD_KEY_DOWN`, `RELOAD_KEY_UP`,
 `RELOAD_WAIT_STARTED`, `RELOAD_COMPLETED`, and `RELOAD_FAILED`. Each trace has
@@ -275,7 +316,11 @@ the selected weapon, generation, worker source/phase, enabled state, elapsed
 milliseconds, and reason. For both weapon profiles, `FINAL_SHOT_UP` and
 `RELOAD_KEY_DOWN` must carry the same elapsed timestamp.
 
-Confirmed foreground loss is one transaction: disable, invalidate the
+Initial non-target or uncertain observations establish a startup baseline and
+leave the initial assumed aim state at `AIM_OFF`. The controller records when
+Helldivers is first observed `ACTIVE_CERTAIN`; only a later inactive/uncertain
+transition is a genuine foreground loss. Confirmed genuine foreground loss is
+one transaction: disable, invalidate the
 generation, cancel work, release owned input, retain the
 selected weapon, and mark affected ammunition `UNKNOWN`. Foreground regain
 alone never reloads, fires, plays audio, or replays clicks. A physical MB1-up
@@ -347,9 +392,10 @@ before the firing worker is activated.
 
 ## Audio
 
-- ON: 1000 Hz for 100 ms, queued once on an accepted immediate enable edge.
+- ON: 1000 Hz for 100 ms, queued once on an aimed accepted immediate enable edge.
 - OFF: 500 Hz for 150 ms, exactly once when an enabled macro is disabled. Shift
-  queues OFF once when it stops active firing; idle Shift is silent.
+  or deferred RMB-off queues OFF once when it stops active firing; idle input
+  and aim-required rejection are silent.
 
 Preparation, selection, startup, and idle cancellation are silent. Audio uses a
 dedicated FIFO thread and cannot delay hook callbacks, input release, or timing.
@@ -370,18 +416,24 @@ python main.py --test-audio
 python main.py --live
 ```
 
-Only `--live` installs hooks, suppresses paired physical MB1/foreground Shift, or generates
-input. `--test-audio` plays only the configured tones. Dry runs, simulation,
+Only `--live` installs hooks, suppresses paired physical MB1/foreground Shift
+or firing-RMB, or generates input. `--test-audio` plays only the configured
+tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through AJ and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
-the existing controller regressions plus immediate UNKNOWN start, switch-settle
+A through AT and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+the existing controller regressions plus aimed immediate UNKNOWN-ammunition start, switch-settle
 preemption, active-reload preemption, immediate stop, and first-cycle reload
 synchronization all pass. Scenario V verifies zero-gap SECONDARY reload;
 scenarios W through AC preserve timing, reload, and toggle-aim regressions;
 scenarios AD through AJ verify firing/idle conditional aim-off ordering,
 persistent-sprint RMB isolation, a second sprint toggle, existing-reload
-preservation, zero Shift-created `R`, and foreground cleanup.
+preservation, zero Shift-created `R`, and foreground cleanup. Scenarios AK
+through AS verify both un-aimed rejections, FIFO aim-on/start, deferred RMB-off
+for both weapons, persistent-sprint RMB/Shift paths, foreground cancellation,
+and preservation of an already-started reload without duplicate `R`. Scenario
+AT reproduces PowerShell-at-launch, first Helldivers acquisition, physical RMB,
+and MB1 reaching `MACRO_ENABLED` and `FIRING_STARTED`.
 
 The complete non-live validation set is:
 
@@ -418,5 +470,11 @@ application does not send blind reload retries.
 Aim state is inferred only from foreground physical MB2 edges and successful
 owned output. Game-side aim changes, missed events, focus changes, UI actions,
 or rejected input can desynchronize that assumption. Foreground loss and
-ambiguous pending-output races therefore set it to `UNKNOWN`; Shift never sends
-a blind MB2 toggle from `UNKNOWN`.
+ambiguous pending-output races therefore set it to `UNKNOWN`; unmodified MB1 is
+then rejected until a physical foreground RMB-down explicitly resynchronizes
+aim ON. Shift never sends a blind MB2 toggle from `UNKNOWN`; after a successful
+owned Shift replay it conservatively normalizes the inferred state to
+`AIM_OFF`. The application cannot inspect the game's actual aim or
+persistent-sprint state. A captured RMB-off pair is replayed once with ordinary
+marked input; if the game rejects it, firing remains disabled and aim becomes
+`UNKNOWN` without a blind retry.

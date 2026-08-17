@@ -5,7 +5,7 @@ import time
 from typing import Callable, Protocol
 
 from .config import AppConfig
-from .input_backend import InputApiError
+from .input_backend import InputApiError, InputCoordination
 from .models import (
     CycleStep,
     OutputAction,
@@ -186,6 +186,8 @@ class MacroEngine:
         progress: Callable[[WorkerProgressUpdate], None] = lambda _progress: None,
         finish_after_reload: threading.Event | None = None,
         reload_started: Callable[[], None] = lambda: None,
+        firing_started: Callable[[], None] = lambda: None,
+        firing_stopped: Callable[[], None] = lambda: None,
     ) -> WorkerResult:
         error: BaseException | None = None
         canceled = False
@@ -213,6 +215,7 @@ class MacroEngine:
                 shot_count = 0
                 reload_phase_started = False
                 reload_completed = False
+                firing_snapshot_published = False
                 index = 0
                 while index < len(steps):
                     step = steps[index]
@@ -241,12 +244,21 @@ class MacroEngine:
                     # Consecutive output actions share one short I/O boundary.
                     # Each profile's final MB1-up and R-down therefore have no wait,
                     # controller queue operation, or lock release between them.
+                    if (
+                        OutputAction.MB1_DOWN in actions
+                        and not firing_snapshot_published
+                    ):
+                        firing_started()
+                        firing_snapshot_published = True
                     self._perform_outputs(
                         actions,
                         cancel_event,
                         shutdown_event,
                         reload_started,
                     )
+                    if OutputAction.R_DOWN in actions:
+                        firing_stopped()
+                        firing_snapshot_published = False
                     for action in actions:
                         if action is OutputAction.MB1_DOWN:
                             shot_count += 1
@@ -291,6 +303,7 @@ class MacroEngine:
             error = exc
             if reload_phase_started and not reload_completed:
                 report(WorkerProgress.RELOAD_FAILED, str(exc))
+        firing_stopped()
         return self._finish_result(
             success=success,
             canceled=canceled,
@@ -436,6 +449,56 @@ class MacroEngine:
             release_owned=self.backend.release_shift_inputs,
         )
 
+    def send_aim_off_transaction(
+        self,
+        cancel_event: threading.Event,
+        shutdown_event: threading.Event,
+        progress: Callable[[WorkerProgressUpdate], None] = lambda _progress: None,
+        aim_started: Callable[[], None] = lambda: None,
+        aim_sent: Callable[[], None] = lambda: None,
+    ) -> WorkerResult:
+        """Replay one captured physical RMB pair after firing cleanup."""
+        error: BaseException | None = None
+        canceled = False
+        success = False
+
+        def report(phase: WorkerProgress, reason: str) -> None:
+            progress(WorkerProgressUpdate(phase, self._clock(), reason))
+
+        try:
+            with self.io_lock:
+                self._check_active(cancel_event, shutdown_event)
+                self.backend.aim_down()
+                aim_started()
+            report(
+                WorkerProgress.AIM_OFF_REPLAY_DOWN,
+                "owned tagged deferred RMB-off replay pressed",
+            )
+            self._cancelable_wait(
+                CONTROL_REPLAY_PRESS_MS, cancel_event, shutdown_event
+            )
+            with self.io_lock:
+                self._check_active(cancel_event, shutdown_event)
+                self.backend.aim_up()
+                aim_sent()
+            report(
+                WorkerProgress.AIM_OFF_REPLAY_UP,
+                "owned tagged deferred RMB-off replay released",
+            )
+            success = True
+        except InterruptedError:
+            canceled = True
+        except (ForegroundLost, InputApiError) as exc:
+            error = exc
+        except BaseException as exc:
+            error = exc
+        return self._finish_result(
+            success=success,
+            canceled=canceled,
+            error=error,
+            release_owned=self.backend.release_shift_inputs,
+        )
+
     def forward_bypass(
         self,
         physical_release: threading.Event,
@@ -489,6 +552,7 @@ class MacroWorker:
         shutdown_event: threading.Event,
         on_complete: Callable[[int, WorkerResult], None],
         on_progress: Callable[[int, WorkerProgressUpdate], None],
+        coordination: InputCoordination | None = None,
     ) -> None:
         self.token = token
         self.request = request
@@ -497,6 +561,7 @@ class MacroWorker:
         self._shutdown = shutdown_event
         self._on_complete = on_complete
         self._on_progress = on_progress
+        self._coordination = coordination
         self.cancel_event = threading.Event()
         self._finish_after_reload = threading.Event()
         self._reload_started = threading.Event()
@@ -533,6 +598,8 @@ class MacroWorker:
                 ):
                     self._engine.backend.reload_up()
                 elif self.request.kind is WorkerKind.SHIFT_TRANSACTION:
+                    self._engine.backend.release_shift_inputs()
+                elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
                     self._engine.backend.release_shift_inputs()
                 else:
                     self._engine.backend.release_all()
@@ -610,6 +677,16 @@ class MacroWorker:
                 macro_progress,
                 self._finish_after_reload,
                 self._reload_started.set,
+                (
+                    self._coordination.firing_started
+                    if self._coordination is not None
+                    else lambda: None
+                ),
+                (
+                    self._coordination.firing_stopped
+                    if self._coordination is not None
+                    else lambda: None
+                ),
             )
         elif self.request.kind in (
             WorkerKind.PREPARATION,
@@ -633,6 +710,14 @@ class MacroWorker:
                 self._aim_sent.set,
                 self._shift_started.set,
                 self._shift_sent.set,
+            )
+        elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
+            result = self._engine.send_aim_off_transaction(
+                self.cancel_event,
+                self._shutdown,
+                lambda update: self._on_progress(self.token, update),
+                self._aim_started.set,
+                self._aim_sent.set,
             )
         elif self.request.kind is WorkerKind.BYPASS:
             result = self._engine.forward_bypass(

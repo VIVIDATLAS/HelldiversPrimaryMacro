@@ -59,9 +59,9 @@ class FakeClock:
 
 
 class FakeForeground:
-    def __init__(self) -> None:
-        self.active = True
-        self.certain = True
+    def __init__(self, active: bool = True, certain: bool = True) -> None:
+        self.active = active
+        self.certain = certain
 
     def status(self) -> tuple[bool, bool]:
         return self.active and self.certain, self.certain
@@ -223,6 +223,9 @@ class FakeSessionWorker:
         elif self.request.kind is WorkerKind.SHIFT_TRANSACTION:
             if self.harness.auto_complete_shift:
                 self.finish_shift_transaction()
+        elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
+            if self.harness.auto_complete_shift:
+                self.finish_aim_off_transaction()
         elif self.request.kind is WorkerKind.BYPASS:
             self.harness.backend.release_all()
             if not self.harness.foreground.is_confirmed_active():
@@ -293,6 +296,7 @@ class FakeSessionWorker:
                     )
             elif step.action is OutputAction.R_DOWN:
                 self.harness.backend.reload_down()
+                self.harness.coordination.firing_stopped()
                 self.reload_started = True
                 self.progress(
                     WorkerProgress.RELOAD_KEY_DOWN,
@@ -321,6 +325,7 @@ class FakeSessionWorker:
             raise AssertionError("only an active macro can begin reload")
         self.harness.backend.mouse_up()
         self.harness.backend.reload_down()
+        self.harness.coordination.firing_stopped()
         self.reload_started = True
         self.progress(
             WorkerProgress.RELOAD_KEY_DOWN,
@@ -357,6 +362,7 @@ class FakeSessionWorker:
     def begin_next_cycle(self) -> None:
         if self.request.kind is not WorkerKind.MACRO or self.completed:
             raise AssertionError("only an active macro can begin another cycle")
+        self.harness.coordination.firing_started()
         self.harness.backend.mouse_down()
         self.progress(WorkerProgress.SHOT_BEGAN, "generated shot began")
 
@@ -370,17 +376,28 @@ class FakeSessionWorker:
 
     def begin_aim_off(self) -> None:
         if (
-            self.request.kind is not WorkerKind.SHIFT_TRANSACTION
+            self.request.kind not in (
+                WorkerKind.SHIFT_TRANSACTION,
+                WorkerKind.AIM_OFF_TRANSACTION,
+            )
             or not self.request.cancel_aim
             or self.completed
         ):
             raise AssertionError("transaction has no active aim-off output")
         self.harness.backend.aim_down()
         self.aim_started = True
+        if self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
+            self.progress(
+                WorkerProgress.AIM_OFF_REPLAY_DOWN,
+                "owned tagged deferred RMB-off replay pressed",
+            )
 
     def finish_aim_off(self) -> None:
         if (
-            self.request.kind is not WorkerKind.SHIFT_TRANSACTION
+            self.request.kind not in (
+                WorkerKind.SHIFT_TRANSACTION,
+                WorkerKind.AIM_OFF_TRANSACTION,
+            )
             or not self.request.cancel_aim
             or self.completed
         ):
@@ -390,10 +407,26 @@ class FakeSessionWorker:
         self.harness.clock.advance_ms(20)
         self.harness.backend.aim_up()
         self.aim_sent = True
-        self.progress(
-            WorkerProgress.AIM_OFF_SENT,
-            "owned tagged MB2 aim-off pair completed before Shift replay",
-        )
+        if self.request.kind is WorkerKind.SHIFT_TRANSACTION:
+            self.progress(
+                WorkerProgress.AIM_OFF_SENT,
+                "owned tagged MB2 aim-off pair completed before Shift replay",
+            )
+        else:
+            self.progress(
+                WorkerProgress.AIM_OFF_REPLAY_UP,
+                "owned tagged deferred RMB-off replay released",
+            )
+
+    def finish_aim_off_transaction(self) -> None:
+        if (
+            self.request.kind is not WorkerKind.AIM_OFF_TRANSACTION
+            or self.completed
+        ):
+            raise AssertionError("only a deferred RMB-off transaction can finish")
+        self.begin_aim_off()
+        self.finish_aim_off()
+        self.finish(WorkerResult(True))
 
     def begin_shift_replay(self) -> None:
         if self.request.kind is not WorkerKind.SHIFT_TRANSACTION or self.completed:
@@ -426,9 +459,9 @@ class FakeSessionWorker:
             return
         if self.request.kind is WorkerKind.PREPARATION and self.cancel_requested:
             self.harness.backend.reload_up()
-        if (
-            self.request.kind is WorkerKind.SHIFT_TRANSACTION
-            and self.cancel_requested
+        if self.request.kind in (
+            WorkerKind.SHIFT_TRANSACTION,
+            WorkerKind.AIM_OFF_TRANSACTION,
         ):
             self.harness.backend.release_shift_inputs()
         self.completed = True
@@ -446,7 +479,10 @@ class FakeSessionWorker:
                 WorkerKind.RELOAD_ONLY,
             ):
                 self.harness.backend.reload_up()
-            elif self.request.kind is WorkerKind.SHIFT_TRANSACTION:
+            elif self.request.kind in (
+                WorkerKind.SHIFT_TRANSACTION,
+                WorkerKind.AIM_OFF_TRANSACTION,
+            ):
                 self.harness.backend.release_shift_inputs()
             elif self.request.kind is WorkerKind.BYPASS:
                 self.harness.backend.mouse_up()
@@ -508,6 +544,8 @@ class SimulationHarness:
         auto_complete_preparation: bool = True,
         auto_complete_cancel: bool = True,
         auto_complete_aim_off: bool = True,
+        foreground_active: bool = True,
+        foreground_certain: bool = True,
     ) -> None:
         self.config = replace(
             config,
@@ -516,7 +554,10 @@ class SimulationHarness:
         self.auto_complete_preparation = auto_complete_preparation
         self.auto_complete_cancel = auto_complete_cancel
         self.auto_complete_shift = auto_complete_aim_off
-        self.foreground = FakeForeground()
+        self.foreground = FakeForeground(
+            foreground_active,
+            foreground_certain,
+        )
         self.clock = FakeClock()
         self.audio = FakeAudioNotifier()
         self.coordination = InputCoordination()
@@ -629,6 +670,7 @@ class SimulationHarness:
 
     def start(self, mode: WeaponMode) -> None:
         self.make_full(mode)
+        self.aim_on()
         self.clock.advance_ms(self.config.controls.toggle_debounce_ms)
         self.click()
         expected = (
@@ -639,6 +681,21 @@ class SimulationHarness:
         if self.machine.state is not expected:
             raise AssertionError(f"expected {expected.name}, got {self.machine.state.name}")
 
+    def aim_on(self) -> None:
+        if self.machine.aim_state is AimState.AIM_ON:
+            return
+        if self.machine.aim_state not in (AimState.AIM_OFF, AimState.UNKNOWN):
+            raise AssertionError(
+                f"cannot establish AIM_ON from {self.machine.aim_state.name}"
+            )
+        if self.policy.mouse(WM_RBUTTONDOWN, 0, 0):
+            raise AssertionError("idle physical RMB-down must pass through")
+        if self.policy.mouse(WM_RBUTTONUP, 0, 0):
+            raise AssertionError("idle physical RMB-up must pass through")
+        self.drain()
+        if self.machine.aim_state is not AimState.AIM_ON:
+            raise AssertionError("physical RMB did not establish AIM_ON")
+
     def foreground_loss(self, *, certain: bool = True) -> None:
         self.foreground.active = False
         self.foreground.certain = certain
@@ -648,6 +705,12 @@ class SimulationHarness:
             else ControlEventKind.FOREGROUND_UNCERTAIN,
             EventSource.FOREGROUND,
         )
+        self.drain()
+
+    def foreground_acquired(self) -> None:
+        self.foreground.active = True
+        self.foreground.certain = True
+        self.send(ControlEventKind.FOREGROUND_ACTIVE, EventSource.FOREGROUND)
         self.drain()
 
 
@@ -679,6 +742,7 @@ def simulate_weapon_session(
     logical_selections = h.hook_events.count(selection_kind)
     if mode is WeaponMode.SECONDARY:
         h.make_full(mode)
+    h.aim_on()
     h.clock.advance_ms(config.controls.toggle_debounce_ms)
     start_pair = h.click()
     running_state = (
@@ -747,14 +811,16 @@ def _scenario_c(config: AppConfig) -> str:
 def _scenario_d(config: AppConfig) -> str:
     h = SimulationHarness(config, auto_complete_preparation=False)
     before = h.clock.now
-    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
-    h.drain()
-    assert h.machine.state is MacroState.RUNNING_PRIMARY
-    assert h.machine.enabled and not h.machine.preparing
+    assert h.click() == (True, True)
+    assert h.machine.state is MacroState.IDLE_PRIMARY
+    assert not h.machine.enabled and not h.machine.preparing
     assert h.clock.now == before
-    assert h.audio.events == ["ON"]
-    assert [name for name, _state in h.backend.events] == ["MB1_DOWN"]
-    return "UNKNOWN PRIMARY fired on MB1-down without preparation"
+    assert h.audio.events == [] and h.backend.events == [] and h.workers == []
+    assert any(
+        report.startswith("START_REJECTED:") and "reason=AIM_REQUIRED" in report
+        for report in h.reports
+    )
+    return "un-aimed PRIMARY was rejected without output or audio"
 
 
 def _scenario_e(config: AppConfig) -> str:
@@ -929,6 +995,7 @@ def _scenario_m(config: AppConfig) -> str:
     pair = SimulationHarness(
         config, auto_complete_preparation=False, auto_complete_cancel=False
     )
+    pair.aim_on()
     assert pair.policy.mouse(WM_LBUTTONDOWN, 0, 0)
     pair.drain()
     old = pair.machine.worker
@@ -987,6 +1054,7 @@ def _scenario_n(config: AppConfig) -> str:
 
 def _scenario_o(config: AppConfig) -> str:
     h = SimulationHarness(config, trace=True, auto_complete_preparation=False)
+    h.aim_on()
     before = h.clock.now
     assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
     assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
@@ -1009,6 +1077,7 @@ def _scenario_p(config: AppConfig) -> str:
     h.key_press(VK_2)
     preparation = h.machine.worker
     assert isinstance(preparation, FakeSessionWorker)
+    h.aim_on()
     generation = h.machine.generation
     before = h.clock.now
     assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
@@ -1051,6 +1120,7 @@ def _scenario_q(config: AppConfig) -> str:
     assert isinstance(preparation, FakeSessionWorker)
     assert preparation.request.mode is WeaponMode.PRIMARY
     preparation.begin_reload()
+    h.aim_on()
     before = h.clock.now
     assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
     h.drain()
@@ -1069,6 +1139,7 @@ def _scenario_q(config: AppConfig) -> str:
 
 def _scenario_r(config: AppConfig) -> str:
     h = SimulationHarness(config, auto_complete_cancel=False)
+    h.aim_on()
     assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
     h.drain()
     macro = h.machine.worker
@@ -1090,6 +1161,7 @@ def _scenario_r(config: AppConfig) -> str:
 
 def _scenario_s(config: AppConfig) -> str:
     h = SimulationHarness(config)
+    h.aim_on()
     assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
     h.drain()
     macro = h.machine.worker
@@ -1113,6 +1185,7 @@ def _scenario_s(config: AppConfig) -> str:
 
 def _scenario_t(config: AppConfig) -> str:
     h = SimulationHarness(config, trace=False)
+    h.aim_on()
     started_at = round(h.clock() * 1000)
     assert h.click() == (True, True)
     assert h.audio.events == ["ON"]
@@ -1265,6 +1338,7 @@ def _scenario_v(config: AppConfig) -> str:
 
 def _scenario_w(config: AppConfig) -> str:
     h = SimulationHarness(config, trace=True)
+    h.aim_on()
     started_at = round(h.clock() * 1000)
     assert h.click() == (True, True)
     macro = h.machine.worker
@@ -1330,7 +1404,13 @@ def _scenario_x(config: AppConfig) -> str:
         reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
         assert all(h.key_press(shift_vk, repeats=2))
         emitted = [name for name, _state in h.backend.events[before:]]
-        assert emitted == ["MB1_UP", "SHIFT_DOWN", "SHIFT_UP"]
+        assert emitted == [
+            "MB1_UP",
+            "MB2_DOWN",
+            "MB2_UP",
+            "SHIFT_DOWN",
+            "SHIFT_UP",
+        ]
         assert not h.machine.enabled and not h.machine.firing
         assert h.machine.worker is None
         assert h.machine.magazine_state(mode) is MagazineState.UNKNOWN
@@ -1427,11 +1507,6 @@ def _toggle_aim_twice(h: SimulationHarness) -> None:
 
 
 def _scenario_aa(config: AppConfig) -> str:
-    for mode in WeaponMode:
-        firing = SimulationHarness(config)
-        firing.start(mode)
-        _toggle_aim_twice(firing)
-
     preparation = SimulationHarness(config, auto_complete_preparation=False)
     preparation.key_press(VK_2)
     _toggle_aim_twice(preparation)
@@ -1449,7 +1524,7 @@ def _scenario_aa(config: AppConfig) -> str:
 
     idle = SimulationHarness(config)
     _toggle_aim_twice(idle)
-    return "physical MB2 toggled assumed aim with zero macro-state effect"
+    return "disabled physical MB2 toggled aim with zero macro-state effect"
 
 
 def _scenario_ab(config: AppConfig) -> str:
@@ -1549,9 +1624,6 @@ def _scenario_ac(config: AppConfig) -> str:
 def _scenario_ad(config: AppConfig) -> str:
     h = SimulationHarness(config, trace=True)
     h.start(WeaponMode.PRIMARY)
-    h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
-    h.policy.mouse(WM_RBUTTONUP, 0, 0)
-    h.drain()
     before = len(h.backend.events)
     reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
     assert all(h.key_press(VK_LSHIFT, repeats=2))
@@ -1575,10 +1647,16 @@ def _scenario_ae(config: AppConfig) -> str:
     reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
     assert all(h.key_press(VK_RSHIFT, repeats=2))
     emitted = [name for name, _state in h.backend.events[before:]]
-    assert emitted == ["MB1_UP", "SHIFT_DOWN", "SHIFT_UP"]
-    assert "MB2_DOWN" not in emitted and "R_DOWN" not in emitted
+    assert emitted == [
+        "MB1_UP",
+        "MB2_DOWN",
+        "MB2_UP",
+        "SHIFT_DOWN",
+        "SHIFT_UP",
+    ]
+    assert "R_DOWN" not in emitted
     assert sum(name == "R_DOWN" for name, _state in h.backend.events) == reloads
-    return "firing without aim stopped before one Shift replay and no R"
+    return "SECONDARY aim-off completed before one Shift replay and no R"
 
 
 def _scenario_af(config: AppConfig) -> str:
@@ -1697,6 +1775,186 @@ def _scenario_aj(config: AppConfig) -> str:
     return "foreground loss cleaned pending MB2, Shift, MB1, and R ownership"
 
 
+def _scenario_ak(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=True)
+    assert h.click() == (True, True)
+    assert not h.machine.enabled and h.machine.worker is None
+    assert h.audio.events == [] and h.backend.events == []
+    assert any("event=AIM_REQUIRED_REJECTED" in item for item in h.reports)
+    return "un-aimed PRIMARY activation was deterministically rejected"
+
+
+def _scenario_al(config: AppConfig) -> str:
+    h = SimulationHarness(config, trace=True)
+    h.make_full(WeaponMode.SECONDARY)
+    baseline = len(h.backend.events)
+    assert h.click() == (True, True)
+    assert not h.machine.enabled and h.machine.worker is None
+    assert len(h.backend.events) == baseline and h.audio.events == []
+    assert any("reason=AIM_REQUIRED" in item for item in h.reports)
+    return "un-aimed SECONDARY activation was deterministically rejected"
+
+
+def _scenario_am(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    assert not h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert h.policy.mouse(WM_LBUTTONDOWN, 0, 0)
+    assert h.policy.mouse(WM_LBUTTONUP, 0, 0)
+    h.drain()
+    assert h.machine.aim_state is AimState.AIM_ON
+    assert h.machine.enabled and h.machine.state is MacroState.RUNNING_PRIMARY
+    assert h.audio.events == ["ON"]
+    assert h.backend.events == [("MB1_DOWN", "RUNNING_PRIMARY")]
+    assert not h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    return "rapid physical aim-on then MB1 was accepted in FIFO order"
+
+
+def _rmb_off_while_firing(config: AppConfig, mode: WeaponMode) -> None:
+    h = SimulationHarness(config, trace=True)
+    h.start(mode)
+    before = len(h.backend.events)
+    reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+    assert h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    assert [name for name, _state in h.backend.events[before:]] == [
+        "MB1_UP",
+        "MB2_DOWN",
+        "MB2_UP",
+    ]
+    assert not h.machine.enabled and not h.machine.firing
+    assert h.machine.aim_state is AimState.AIM_OFF
+    assert h.audio.events == ["ON", "OFF"]
+    assert sum(name == "R_DOWN" for name, _state in h.backend.events) == reloads
+    assert not any(name == "SHIFT_DOWN" for name, _state in h.backend.events[before:])
+
+
+def _scenario_an(config: AppConfig) -> str:
+    _rmb_off_while_firing(config, WeaponMode.PRIMARY)
+    return "deferred RMB-off stopped PRIMARY before replay with no Shift or R"
+
+
+def _scenario_ao(config: AppConfig) -> str:
+    _rmb_off_while_firing(config, WeaponMode.SECONDARY)
+    return "deferred RMB-off stopped SECONDARY before replay with no Shift or R"
+
+
+def _scenario_ap(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    h.key_press(VK_LSHIFT)
+    sprint_shifts = sum(name == "SHIFT_DOWN" for name, _state in h.backend.events)
+    h.aim_on()
+    h.click()
+    reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+    assert h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    assert not h.machine.enabled and h.machine.aim_state is AimState.AIM_OFF
+    assert sum(name == "SHIFT_DOWN" for name, _state in h.backend.events) == sprint_shifts
+    assert sum(name == "R_DOWN" for name, _state in h.backend.events) == reloads
+    return "persistent sprint aim/fire/RMB-off emitted no extra Shift or R"
+
+
+def _scenario_aq(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    h.key_press(VK_LSHIFT)
+    h.aim_on()
+    h.click()
+    before = len(h.backend.events)
+    reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+    h.key_press(VK_RSHIFT, repeats=2)
+    assert [name for name, _state in h.backend.events[before:]] == [
+        "MB1_UP",
+        "MB2_DOWN",
+        "MB2_UP",
+        "SHIFT_DOWN",
+        "SHIFT_UP",
+    ]
+    assert not h.machine.enabled and h.machine.aim_state is AimState.AIM_OFF
+    assert sum(name == "R_DOWN" for name, _state in h.backend.events) == reloads
+    return "persistent sprint aim/fire/Shift preserved stop-aim-off-toggle ordering"
+
+
+def _scenario_ar(config: AppConfig) -> str:
+    h = SimulationHarness(
+        config,
+        auto_complete_cancel=False,
+        auto_complete_aim_off=False,
+    )
+    h.start(WeaponMode.PRIMARY)
+    assert h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    aim_worker = next(
+        worker
+        for worker in h.workers
+        if worker.request.kind is WorkerKind.AIM_OFF_TRANSACTION
+    )
+    aim_worker.begin_aim_off()
+    h.drain()
+    h.foreground_loss()
+    assert not any(
+        (
+            h.backend.mouse_owned,
+            h.backend.aim_owned,
+            h.backend.shift_owned,
+            h.backend.reload_owned,
+        )
+    )
+    assert h.machine.aim_state is AimState.UNKNOWN and not h.machine.enabled
+    return "foreground loss canceled deferred RMB-off and released all owned input"
+
+
+def _scenario_as(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    h.start(WeaponMode.PRIMARY)
+    macro = h.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    macro.begin_macro_reload()
+    h.drain()
+    reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+    assert not h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+    assert not h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    assert macro.finish_after_reload_requested and not h.machine.enabled
+    assert sum(name == "R_DOWN" for name, _state in h.backend.events) == reloads
+    macro.complete_macro_reload()
+    h.drain()
+    assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.FULL
+    assert not h.machine.enabled and h.machine.worker is None
+    return "RMB-off preserved an already-started reload without duplicate R"
+
+
+def _scenario_at(config: AppConfig) -> str:
+    h = SimulationHarness(
+        config,
+        trace=True,
+        foreground_active=False,
+        foreground_certain=True,
+    )
+    h.foreground_loss()
+    assert h.machine.aim_state is AimState.AIM_OFF
+    assert not h.machine.target_has_been_active
+    h.foreground_acquired()
+    assert h.machine.target_has_been_active
+    assert h.machine.aim_state is AimState.AIM_OFF
+    h.aim_on()
+    h.click()
+    assert h.machine.aim_state is AimState.AIM_ON
+    assert h.machine.enabled and h.machine.state is MacroState.RUNNING_PRIMARY
+    events = [
+        report.split("event=", 1)[1].split(" ", 1)[0]
+        for report in h.reports
+        if report.startswith("TRACE:")
+    ]
+    assert "AIM_PHYSICAL_ON" in events
+    assert events[-2:] == ["MACRO_ENABLED", "FIRING_STARTED"]
+    assert not any("event=AIM_REQUIRED_REJECTED" in item for item in h.reports)
+    return "PowerShell baseline then target RMB/MB1 reached FIRING_STARTED"
+
+
 _SCENARIOS = (
     ("A", _scenario_a),
     ("B", _scenario_b),
@@ -1734,6 +1992,16 @@ _SCENARIOS = (
     ("AH", _scenario_ah),
     ("AI", _scenario_ai),
     ("AJ", _scenario_aj),
+    ("AK", _scenario_ak),
+    ("AL", _scenario_al),
+    ("AM", _scenario_am),
+    ("AN", _scenario_an),
+    ("AO", _scenario_ao),
+    ("AP", _scenario_ap),
+    ("AQ", _scenario_aq),
+    ("AR", _scenario_ar),
+    ("AS", _scenario_as),
+    ("AT", _scenario_at),
 )
 
 

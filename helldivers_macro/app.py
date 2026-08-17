@@ -63,6 +63,7 @@ def _worker_factory(
     engine: MacroEngine,
     shutdown_event: threading.Event,
     event_queue: queue.Queue[ControlEvent],
+    coordination: InputCoordination | None = None,
 ):
     def create(token: int, request: WorkerRequest) -> MacroWorker:
         def complete(worker_token: int, result: WorkerResult) -> None:
@@ -86,7 +87,13 @@ def _worker_factory(
             )
 
         return MacroWorker(
-            token, request, engine, shutdown_event, complete, progress
+            token,
+            request,
+            engine,
+            shutdown_event,
+            complete,
+            progress,
+            coordination,
         )
 
     return create
@@ -107,7 +114,7 @@ def run_live(config: AppConfig) -> int:
         config,
         cache.is_confirmed_active,
         audio,
-        _worker_factory(engine, shutdown_event, event_queue),
+        _worker_factory(engine, shutdown_event, event_queue, coordination),
         coordination=coordination,
         foreground_status=cache.status,
     )
@@ -122,12 +129,21 @@ def run_live(config: AppConfig) -> int:
             )
         )
 
+    def active() -> None:
+        event_queue.put_nowait(
+            ControlEvent(
+                ControlEventKind.FOREGROUND_ACTIVE,
+                source=EventSource.FOREGROUND,
+            )
+        )
+
     monitor = ForegroundMonitor(
         inspector,
         cache,
         shutdown_event,
         config.target.foreground_poll_ms,
         inactive,
+        active,
     )
     policy = HookPolicy(
         cache.status,

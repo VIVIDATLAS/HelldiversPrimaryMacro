@@ -12,6 +12,7 @@ from .models import (
     ControlEventKind,
     EventSource,
     Mb1PairDecision,
+    Mb2PairDecision,
     ShiftStroke,
 )
 
@@ -99,7 +100,7 @@ class HookPolicy:
         self._keys_down: set[int] = set()
         self._left_pair_decision: Mb1PairDecision | None = None
         self._left_pair_is_manual = False
-        self._right_pair_down = False
+        self._right_pair_decision: Mb2PairDecision | None = None
         self._deferred_shift_pairs: set[int] = set()
 
     @property
@@ -201,17 +202,26 @@ class HookPolicy:
             return False
 
         if message == WM_RBUTTONDOWN:
-            if self._right_pair_down:
-                return False
-            self._right_pair_down = True
+            if self._right_pair_decision is not None:
+                return (
+                    self._right_pair_decision
+                    is Mb2PairDecision.DEFERRED_AIM_OFF
+                )
             active, _certain = self._foreground_status()
+            if active and self._coordination.firing_active():
+                self._right_pair_decision = Mb2PairDecision.DEFERRED_AIM_OFF
+                self._emit(ControlEventKind.DEFERRED_AIM_OFF)
+                return True
+            self._right_pair_decision = Mb2PairDecision.PASS_THROUGH
             if active:
                 self._emit(ControlEventKind.PHYSICAL_MB2_DOWN)
             return False
         if message == WM_RBUTTONUP:
-            was_down = self._right_pair_down
-            self._right_pair_down = False
-            if was_down:
+            decision = self._right_pair_decision
+            self._right_pair_decision = None
+            if decision is Mb2PairDecision.DEFERRED_AIM_OFF:
+                return True
+            if decision is Mb2PairDecision.PASS_THROUGH:
                 self._emit(ControlEventKind.PHYSICAL_MB2_UP)
             return False
 

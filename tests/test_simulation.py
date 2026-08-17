@@ -69,6 +69,16 @@ class SimulatedSessionTests(unittest.TestCase):
             "AH",
             "AI",
             "AJ",
+            "AK",
+            "AL",
+            "AM",
+            "AN",
+            "AO",
+            "AP",
+            "AQ",
+            "AR",
+            "AS",
+            "AT",
         ]:
             self.assertIn(f"SCENARIO {label}: PASS", text)
         self.assertIn("DETERMINISTIC CONTROL SIMULATION: PASS", text)

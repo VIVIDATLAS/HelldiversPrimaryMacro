@@ -5,7 +5,7 @@ import threading
 import unittest
 
 from helldivers_macro.config import load_config
-from helldivers_macro.input_backend import InputApiError
+from helldivers_macro.input_backend import InputApiError, InputCoordination
 from helldivers_macro.macro_engine import (
     MacroEngine,
     MacroWorker,
@@ -521,6 +521,43 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertFalse(lock.held)
 
+    def test_deferred_aim_off_replays_one_owned_pair_without_shift_or_reload(self) -> None:
+        fake_time = FakeTime()
+        backend = RecordingBackend(clock=fake_time.clock)
+        lock = TrackingLock()
+        progress = []
+
+        def wait(event: threading.Event, seconds: float) -> bool:
+            self.assertFalse(lock.held)
+            return fake_time.wait(event, seconds)
+
+        result = MacroEngine(
+            CONFIG,
+            backend,
+            lambda: True,
+            clock=fake_time.clock,
+            wait=wait,
+            io_lock=lock,
+        ).send_aim_off_transaction(
+            threading.Event(),
+            threading.Event(),
+            progress.append,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(
+            backend.timed_events,
+            [("MB2_DOWN", 0), ("MB2_UP", 20)],
+        )
+        self.assertEqual(
+            [update.phase for update in progress],
+            [
+                WorkerProgress.AIM_OFF_REPLAY_DOWN,
+                WorkerProgress.AIM_OFF_REPLAY_UP,
+            ],
+        )
+        self.assertFalse(backend.aim_owned)
+        self.assertFalse(lock.held)
+
     def test_macro_waits_never_hold_output_lock(self) -> None:
         backend = RecordingBackend()
         fake_time = FakeTime()
@@ -798,6 +835,53 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertFalse(completed[0].canceled)
         self.assertEqual(backend.events.count("R_DOWN"), 2)
         self.assertEqual(backend.events.count("R_UP"), 2)
+
+    def test_owned_worker_publishes_firing_snapshot_at_exact_phase_boundaries(self) -> None:
+        backend = RecordingBackend()
+        fake_time = FakeTime()
+        coordination = InputCoordination()
+        observations: list[tuple[WorkerProgress, bool]] = []
+        worker: MacroWorker
+
+        def progress(_token: int, update: WorkerProgressUpdate) -> None:
+            if update.phase in (
+                WorkerProgress.SHOT_BEGAN,
+                WorkerProgress.RELOAD_KEY_DOWN,
+            ):
+                observations.append((update.phase, coordination.firing_active()))
+            if update.phase is WorkerProgress.RELOAD_KEY_DOWN:
+                self.assertTrue(worker.sprint_stop())
+
+        worker = MacroWorker(
+            1,
+            WorkerRequest(WorkerKind.MACRO, WeaponMode.PRIMARY),
+            MacroEngine(
+                CONFIG,
+                backend,
+                lambda: True,
+                clock=fake_time.clock,
+                wait=fake_time.wait,
+            ),
+            threading.Event(),
+            lambda _token, _result: None,
+            progress,
+            coordination,
+        )
+        coordination.macro_started()
+        worker.start()
+        worker.activate()
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(observations)
+        self.assertTrue(
+            all(active for phase, active in observations if phase is WorkerProgress.SHOT_BEGAN)
+        )
+        self.assertEqual(
+            [active for phase, active in observations if phase is WorkerProgress.RELOAD_KEY_DOWN],
+            [False],
+        )
+        self.assertFalse(coordination.firing_active())
 
 
 if __name__ == "__main__":

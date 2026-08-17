@@ -6,6 +6,7 @@ import unittest
 
 from helldivers_macro.foreground import (
     ForegroundCache,
+    ForegroundMonitor,
     PROCESS_QUERY_LIMITED_INFORMATION,
     WindowsForegroundInspector,
 )
@@ -62,6 +63,27 @@ class FakeClock:
         return self.value
 
 
+class SequenceInspector:
+    def __init__(self, observations) -> None:
+        self._observations = iter(observations)
+
+    def inspect(self):
+        return next(self._observations)
+
+
+class CountedShutdown:
+    def __init__(self, samples: int) -> None:
+        self._samples = samples
+        self._waits = 0
+
+    def is_set(self) -> bool:
+        return self._waits >= self._samples
+
+    def wait(self, _seconds: float) -> bool:
+        self._waits += 1
+        return self.is_set()
+
+
 class ForegroundTests(unittest.TestCase):
     def test_basename_match_is_case_insensitive_and_handle_closes(self) -> None:
         user = FakeUser32()
@@ -112,7 +134,29 @@ class ForegroundTests(unittest.TestCase):
         cache.publish(ForegroundObservation(True, False, clock.value))
         self.assertEqual(cache.status(), (False, False))
 
+    def test_monitor_publishes_first_confirmed_target_acquisition(self) -> None:
+        clock = FakeClock()
+        observations = [
+            ForegroundObservation(False, True, clock.value, executable="powershell.exe"),
+            ForegroundObservation(False, False, clock.value + 0.01, error="transient"),
+            ForegroundObservation(True, True, clock.value + 0.02, executable="helldivers2.exe"),
+        ]
+        inactive: list[bool] = []
+        active: list[bool] = []
+        monitor = ForegroundMonitor(
+            SequenceInspector(observations),
+            ForegroundCache(50, clock=clock),
+            CountedShutdown(len(observations)),
+            1,
+            inactive.append,
+            lambda: active.append(True),
+        )
+
+        monitor._run()
+
+        self.assertEqual(inactive, [True])
+        self.assertEqual(active, [True])
+
 
 if __name__ == "__main__":
     unittest.main()
-

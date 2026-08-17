@@ -70,6 +70,7 @@ class InputCoordination:
 
     def __init__(self) -> None:
         self._macro_active = threading.Event()
+        self._firing_active = threading.Event()
         self._cleanup_pending = threading.Event()
 
     def macro_started(self) -> None:
@@ -85,7 +86,18 @@ class InputCoordination:
 
     def cleanup_completed(self) -> None:
         self._macro_active.clear()
+        self._firing_active.clear()
         self._cleanup_pending.clear()
+
+    def firing_started(self) -> None:
+        self._firing_active.set()
+
+    def firing_stopped(self) -> None:
+        self._firing_active.clear()
+
+    def firing_active(self) -> bool:
+        """Lock-free snapshot published at controller/owned-worker phase boundaries."""
+        return self._firing_active.is_set()
 
     def cleanup_pending(self) -> bool:
         return self._cleanup_pending.is_set()

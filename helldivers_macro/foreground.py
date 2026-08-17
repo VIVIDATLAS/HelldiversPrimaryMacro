@@ -166,12 +166,14 @@ class ForegroundMonitor:
         shutdown_event: threading.Event,
         poll_ms: int,
         on_inactive: Callable[[bool], None],
+        on_active: Callable[[], None] = lambda: None,
     ) -> None:
         self._inspector = inspector
         self._cache = cache
         self._shutdown = shutdown_event
         self._poll_seconds = poll_ms / 1000.0
         self._on_inactive = on_inactive
+        self._on_active = on_active
         self._thread = threading.Thread(
             target=self._run, name="foreground-monitor", daemon=False
         )
@@ -193,11 +195,13 @@ class ForegroundMonitor:
                     False, False, time.perf_counter(), error=str(exc)
                 )
             self._cache.publish(observation)
-            if previous_active and not observation.active:
+            active = observation.active and observation.certain
+            if active and not previous_active:
+                self._on_active()
+            elif previous_active and not active:
                 self._on_inactive(not observation.certain)
             elif previous_certain and not observation.certain:
                 self._on_inactive(True)
-            previous_active = observation.active and observation.certain
+            previous_active = active
             previous_certain = observation.certain
             self._shutdown.wait(self._poll_seconds)
-
