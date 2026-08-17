@@ -161,11 +161,15 @@ class WorkerResult:
 
 
 class OutputAction(Enum):
-    MB1_DOWN = "MB1_DOWN"
-    MB1_UP = "MB1_UP"
+    FIRE_DOWN = "FIRE_DOWN"
+    FIRE_UP = "FIRE_UP"
     R_DOWN = "R_DOWN"
     R_UP = "R_UP"
     WAIT = "WAIT"
+    # Compatibility aliases for older fake-cycle callers. Runtime cycle
+    # construction and execution use the device-neutral FIRE names.
+    MB1_DOWN = FIRE_DOWN
+    MB1_UP = FIRE_UP
 
 
 @dataclass(frozen=True)

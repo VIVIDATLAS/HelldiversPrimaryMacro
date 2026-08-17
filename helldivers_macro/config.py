@@ -31,6 +31,12 @@ class ControlsConfig:
 
 
 @dataclass(frozen=True)
+class OutputConfig:
+    fire_device: str
+    fire_scan_code: int | None
+
+
+@dataclass(frozen=True)
 class WeaponsConfig:
     reload_on_select: bool
     switch_settle_ms: int
@@ -61,18 +67,24 @@ class AudioConfig:
 
 @dataclass(frozen=True)
 class PrimaryConfig:
-    shots_per_cycle: int
-    shot_period_ms: int
-    fire_press_ms: int
+    fire_mode: str
+    shots_per_cycle: int | None
+    shot_period_ms: int | None
+    fire_press_ms: int | None
+    automatic_hold_ms: int | None
+    post_fire_reload_delay_ms: int
     reload_press_ms: int
     reload_wait_ms: int
 
 
 @dataclass(frozen=True)
 class SecondaryConfig:
-    shots_per_cycle: int
-    shot_period_ms: int
-    fire_press_ms: int
+    fire_mode: str
+    shots_per_cycle: int | None
+    shot_period_ms: int | None
+    fire_press_ms: int | None
+    automatic_hold_ms: int | None
+    post_fire_reload_delay_ms: int
     reload_press_ms: int
     reload_wait_ms: int
 
@@ -81,6 +93,7 @@ class SecondaryConfig:
 class AppConfig:
     target: TargetConfig
     controls: ControlsConfig
+    output: OutputConfig
     weapons: WeaponsConfig
     behavior: BehaviorConfig
     diagnostics: DiagnosticsConfig
@@ -114,9 +127,54 @@ def _nonnegative(name: str, value: int) -> None:
         raise ConfigError(f"{name} must be non-negative")
 
 
+def _optional_int(
+    table: Mapping[str, Any], table_name: str, name: str
+) -> int | None:
+    if name not in table:
+        return None
+    return _value(table, table_name, name, int)
+
+
+def _weapon_config(
+    table: Mapping[str, Any], table_name: str, config_type: type
+) -> Any:
+    fire_mode = _value(table, table_name, "fire_mode", str)
+    automatic_hold_ms = _optional_int(
+        table, table_name, "automatic_hold_ms"
+    )
+    post_fire_reload_delay_ms = _optional_int(
+        table, table_name, "post_fire_reload_delay_ms"
+    )
+    if fire_mode == "automatic_hold":
+        if automatic_hold_ms is None:
+            raise ConfigError(
+                f"missing configuration value: {table_name}.automatic_hold_ms"
+            )
+        if post_fire_reload_delay_ms is None:
+            raise ConfigError(
+                "missing configuration value: "
+                f"{table_name}.post_fire_reload_delay_ms"
+            )
+    return config_type(
+        fire_mode=fire_mode,
+        shots_per_cycle=_optional_int(table, table_name, "shots_per_cycle"),
+        shot_period_ms=_optional_int(table, table_name, "shot_period_ms"),
+        fire_press_ms=_optional_int(table, table_name, "fire_press_ms"),
+        automatic_hold_ms=automatic_hold_ms,
+        post_fire_reload_delay_ms=(
+            0
+            if post_fire_reload_delay_ms is None
+            else post_fire_reload_delay_ms
+        ),
+        reload_press_ms=_value(table, table_name, "reload_press_ms", int),
+        reload_wait_ms=_value(table, table_name, "reload_wait_ms", int),
+    )
+
+
 def parse_config(data: Mapping[str, Any]) -> AppConfig:
     target_t = _table(data, "target")
     controls_t = _table(data, "controls")
+    output_t = _table(data, "output")
     weapons_t = _table(data, "weapons")
     behavior_t = _table(data, "behavior")
     diagnostics_t = _table(data, "diagnostics")
@@ -158,6 +216,16 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
             controls_t, "controls", "shift_cancels_aim_natively", bool
         ),
     )
+    fire_device = _value(output_t, "output", "fire_device", str)
+    fire_scan_code = output_t.get("fire_scan_code")
+    if fire_scan_code is not None and (
+        not isinstance(fire_scan_code, int) or isinstance(fire_scan_code, bool)
+    ):
+        raise ConfigError("output.fire_scan_code must be an integer")
+    output = OutputConfig(
+        fire_device=fire_device,
+        fire_scan_code=fire_scan_code,
+    )
     weapons = WeaponsConfig(
         reload_on_select=_value(
             weapons_t, "weapons", "reload_on_select", bool
@@ -187,37 +255,12 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
             duration_ms=_value(audio_off_t, "audio.off", "duration_ms", int),
         ),
     )
-    primary = PrimaryConfig(
-        shots_per_cycle=_value(primary_t, "primary", "shots_per_cycle", int),
-        shot_period_ms=_value(
-            primary_t, "primary", "shot_period_ms", int
-        ),
-        fire_press_ms=_value(
-            primary_t, "primary", "fire_press_ms", int
-        ),
-        reload_press_ms=_value(primary_t, "primary", "reload_press_ms", int),
-        reload_wait_ms=_value(primary_t, "primary", "reload_wait_ms", int),
-    )
-    secondary = SecondaryConfig(
-        shots_per_cycle=_value(
-            secondary_t, "secondary", "shots_per_cycle", int
-        ),
-        shot_period_ms=_value(
-            secondary_t, "secondary", "shot_period_ms", int
-        ),
-        fire_press_ms=_value(
-            secondary_t, "secondary", "fire_press_ms", int
-        ),
-        reload_press_ms=_value(
-            secondary_t, "secondary", "reload_press_ms", int
-        ),
-        reload_wait_ms=_value(
-            secondary_t, "secondary", "reload_wait_ms", int
-        ),
-    )
+    primary = _weapon_config(primary_t, "primary", PrimaryConfig)
+    secondary = _weapon_config(secondary_t, "secondary", SecondaryConfig)
     config = AppConfig(
         target,
         controls,
+        output,
         weapons,
         behavior,
         diagnostics,
@@ -258,6 +301,26 @@ def validate_config(config: AppConfig) -> None:
     _nonnegative("controls.toggle_debounce_ms", config.controls.toggle_debounce_ms)
     if config.controls.deferred_bypass_click_ms <= 0:
         raise ConfigError("controls.deferred_bypass_click_ms must be positive")
+    if config.output.fire_device not in {"keyboard", "mouse"}:
+        raise ConfigError(
+            "output.fire_device must be exactly 'keyboard' or 'mouse'"
+        )
+    if config.output.fire_device == "keyboard":
+        if (
+            type(config.output.fire_scan_code) is not int
+            or not 1 <= config.output.fire_scan_code <= 0xFF
+        ):
+            raise ConfigError(
+                "output.fire_scan_code must be an integer from 1 through 255 "
+                "for keyboard output"
+            )
+    elif config.output.fire_scan_code is not None and (
+        type(config.output.fire_scan_code) is not int
+        or not 1 <= config.output.fire_scan_code <= 0xFF
+    ):
+        raise ConfigError(
+            "output.fire_scan_code must be an integer from 1 through 255 when set"
+        )
     _nonnegative("weapons.switch_settle_ms", config.weapons.switch_settle_ms)
     if config.behavior.start_policy != "immediate":
         raise ConfigError("behavior.start_policy supports only 'immediate'")
@@ -269,31 +332,48 @@ def validate_config(config: AppConfig) -> None:
             )
         _nonnegative(f"{name}.duration_ms", tone.duration_ms)
 
-    if config.primary.shots_per_cycle != 45:
-        raise ConfigError("primary.shots_per_cycle must be exactly 45")
-    if config.secondary.shots_per_cycle != 13:
-        raise ConfigError("secondary.shots_per_cycle must be exactly 13")
-    for name, value in (
-        ("primary.shot_period_ms", config.primary.shot_period_ms),
-        ("primary.fire_press_ms", config.primary.fire_press_ms),
-        ("primary.reload_press_ms", config.primary.reload_press_ms),
-        ("primary.reload_wait_ms", config.primary.reload_wait_ms),
-        ("secondary.shot_period_ms", config.secondary.shot_period_ms),
-        ("secondary.fire_press_ms", config.secondary.fire_press_ms),
-        ("secondary.reload_press_ms", config.secondary.reload_press_ms),
-        ("secondary.reload_wait_ms", config.secondary.reload_wait_ms),
+    for name, weapon in (
+        ("primary", config.primary),
+        ("secondary", config.secondary),
     ):
-        _nonnegative(name, value)
-    if config.primary.shots_per_cycle <= 0 or config.secondary.shots_per_cycle <= 0:
-        raise ConfigError("shot counts must be positive")
-    if config.primary.fire_press_ms > config.primary.shot_period_ms:
-        raise ConfigError(
-            "primary.fire_press_ms must not exceed primary.shot_period_ms"
+        if weapon.fire_mode not in {"tap", "automatic_hold"}:
+            raise ConfigError(
+                f"{name}.fire_mode must be exactly 'tap' or 'automatic_hold'"
+            )
+        _nonnegative(f"{name}.reload_press_ms", weapon.reload_press_ms)
+        _nonnegative(f"{name}.reload_wait_ms", weapon.reload_wait_ms)
+        _nonnegative(
+            f"{name}.post_fire_reload_delay_ms",
+            weapon.post_fire_reload_delay_ms,
         )
-    if config.secondary.fire_press_ms > config.secondary.shot_period_ms:
-        raise ConfigError(
-            "secondary.fire_press_ms must not exceed secondary.shot_period_ms"
-        )
+        if weapon.fire_mode == "automatic_hold":
+            if (
+                type(weapon.automatic_hold_ms) is not int
+                or weapon.automatic_hold_ms <= 0
+            ):
+                raise ConfigError(
+                    f"{name}.automatic_hold_ms must be a positive integer"
+                )
+            continue
+        for field in ("shots_per_cycle", "shot_period_ms", "fire_press_ms"):
+            if getattr(weapon, field) is None:
+                raise ConfigError(f"missing configuration value: {name}.{field}")
+        if name == "primary":
+            if (
+                type(weapon.shots_per_cycle) is not int
+                or not 1 <= weapon.shots_per_cycle <= 1000
+            ):
+                raise ConfigError(
+                    "primary.shots_per_cycle must be an integer from 1 through 1000"
+                )
+        elif weapon.shots_per_cycle != 13:
+            raise ConfigError("secondary.shots_per_cycle must be exactly 13")
+        _nonnegative(f"{name}.shot_period_ms", weapon.shot_period_ms)
+        _nonnegative(f"{name}.fire_press_ms", weapon.fire_press_ms)
+        if weapon.fire_press_ms > weapon.shot_period_ms:
+            raise ConfigError(
+                f"{name}.fire_press_ms must not exceed {name}.shot_period_ms"
+            )
 
 
 def load_config(path: str | Path) -> AppConfig:

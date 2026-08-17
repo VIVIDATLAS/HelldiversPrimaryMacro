@@ -4,12 +4,19 @@ import ctypes
 from ctypes import wintypes
 import os
 import threading
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .cadence_diagnostics import CadenceDiagnostics, _BackendEvent
+    from .config import OutputConfig
 
 
-# ASCII "HDMACRO1", truncated naturally on a 32-bit pointer. Windows 11 Pro
-# deployments for this project are expected to be 64-bit.
-INPUT_MARKER = 0x48444D4143524F31
-ULONG_PTR = wintypes.WPARAM
+from .windows_abi import ULONG_PTR, structure_field_type
+
+
+# ASCII "CRO1". The field remains ULONG_PTR, while this canonical marker fits
+# in 32 bits so it survives the observed Windows mouse-hook boundary unchanged.
+INPUT_MARKER = 0x43524F31
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -110,6 +117,9 @@ def validate_ctypes_layouts() -> None:
     pointer_size = ctypes.sizeof(ctypes.c_void_p)
     if ctypes.sizeof(ULONG_PTR) != pointer_size:
         raise RuntimeError("ULONG_PTR is not pointer-sized")
+    for structure in (MOUSEINPUT, KEYBDINPUT):
+        if ctypes.sizeof(structure_field_type(structure, "dwExtraInfo")) != pointer_size:
+            raise RuntimeError(f"{structure.__name__}.dwExtraInfo is not pointer-sized")
     expected_mouse = 32 if pointer_size == 8 else 24
     expected_keyboard = 24 if pointer_size == 8 else 16
     expected_input = 40 if pointer_size == 8 else 28
@@ -120,15 +130,31 @@ def validate_ctypes_layouts() -> None:
 
 
 class SendInputBackend:
-    """Owns generated MB1/MB2/Shift/R downs and releases only owned inputs."""
+    """Owns generated fire/MB1-bypass/MB2/Shift/R input and releases it safely."""
 
-    def __init__(self, *, user32: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        user32: object | None = None,
+        cadence_diagnostics: CadenceDiagnostics | None = None,
+        output: OutputConfig | None = None,
+    ) -> None:
         validate_ctypes_layouts()
         if user32 is None:
             if os.name != "nt":
                 raise InputApiError("SendInput requires Windows")
             user32 = ctypes.WinDLL("user32", use_last_error=True)
         self._user32 = user32
+        self._cadence_diagnostics = cadence_diagnostics
+        self._fire_device = "mouse" if output is None else output.fire_device
+        self._fire_scan_code = None if output is None else output.fire_scan_code
+        if self._fire_device not in {"keyboard", "mouse"}:
+            raise InputApiError(f"unsupported fire output device {self._fire_device!r}")
+        if self._fire_device == "keyboard" and not (
+            type(self._fire_scan_code) is int
+            and 1 <= self._fire_scan_code <= 0xFF
+        ):
+            raise InputApiError("keyboard fire output requires scan code 1..255")
         self._user32.SendInput.argtypes = [
             wintypes.UINT,
             ctypes.POINTER(INPUT),
@@ -142,6 +168,7 @@ class SendInputBackend:
             raise InputApiError("MapVirtualKeyW could not map reload key R")
         self._lock = threading.RLock()
         self._mouse_owned = False
+        self._fire_key_owned = False
         self._aim_owned = False
         self._shift_owned = False
         self._shift_scan = 0
@@ -155,6 +182,23 @@ class SendInputBackend:
     def mouse_owned_snapshot(self) -> bool:
         """Lock-free hook snapshot; ownership writes are atomic under the GIL."""
         return self._mouse_owned
+
+    @property
+    def fire_owned(self) -> bool:
+        with self._lock:
+            return (
+                self._fire_key_owned
+                if self._fire_device == "keyboard"
+                else self._mouse_owned
+            )
+
+    @property
+    def fire_action_names(self) -> tuple[str, str]:
+        return (
+            ("P_DOWN", "P_UP")
+            if self._fire_device == "keyboard"
+            else ("MB1_DOWN", "MB1_UP")
+        )
 
     @property
     def reload_owned(self) -> bool:
@@ -172,12 +216,28 @@ class SendInputBackend:
             return self._shift_owned
 
     def _send_exactly_one(self, input_value: INPUT, description: str) -> None:
+        diagnostic_event: _BackendEvent | None = None
+        if self._cadence_diagnostics is not None:
+            diagnostic_event = self._cadence_diagnostics.send_requested()
         ctypes.set_last_error(0)
-        accepted = int(
-            self._user32.SendInput(1, ctypes.byref(input_value), ctypes.sizeof(INPUT))
-        )
+        try:
+            accepted = int(
+                self._user32.SendInput(
+                    1, ctypes.byref(input_value), ctypes.sizeof(INPUT)
+                )
+            )
+        except BaseException:
+            if self._cadence_diagnostics is not None:
+                self._cadence_diagnostics.send_completed(
+                    diagnostic_event, 0, ctypes.get_last_error()
+                )
+            raise
+        error = ctypes.get_last_error() if accepted != 1 else 0
+        if self._cadence_diagnostics is not None:
+            self._cadence_diagnostics.send_completed(
+                diagnostic_event, accepted, error
+            )
         if accepted != 1:
-            error = ctypes.get_last_error()
             raise InputApiError(
                 f"SendInput accepted {accepted}/1 event for {description} (WinError {error})"
             )
@@ -208,6 +268,32 @@ class SendInputBackend:
                 return
             self._send_exactly_one(self._mouse_input(MOUSEEVENTF_LEFTUP), "MB1 up")
             self._mouse_owned = False
+
+    def fire_down(self) -> None:
+        if self._fire_device == "mouse":
+            self.mouse_down()
+            return
+        with self._lock:
+            if self._fire_key_owned:
+                raise InputApiError("refusing duplicate generated P down")
+            self._send_exactly_one(
+                self._keyboard_input(self._fire_scan_code, key_up=False),
+                "P fire down",
+            )
+            self._fire_key_owned = True
+
+    def fire_up(self) -> None:
+        if self._fire_device == "mouse":
+            self.mouse_up()
+            return
+        with self._lock:
+            if not self._fire_key_owned:
+                return
+            self._send_exactly_one(
+                self._keyboard_input(self._fire_scan_code, key_up=True),
+                "P fire up",
+            )
+            self._fire_key_owned = False
 
     def aim_down(self) -> None:
         with self._lock:
@@ -287,9 +373,28 @@ class SendInputBackend:
     def release_all(self) -> None:
         errors: list[str] = []
         with self._lock:
+            if self._fire_key_owned:
+                try:
+                    if self._cadence_diagnostics is None:
+                        self.fire_up()
+                    else:
+                        self._cadence_diagnostics.record_cleanup_release("P_UP")
+                        with self._cadence_diagnostics.macro_action(
+                            "P_UP", intended=False
+                        ):
+                            self.fire_up()
+                except InputApiError as exc:
+                    errors.append(str(exc))
             if self._mouse_owned:
                 try:
-                    self.mouse_up()
+                    if self._cadence_diagnostics is None:
+                        self.mouse_up()
+                    else:
+                        self._cadence_diagnostics.record_cleanup_release("MB1_UP")
+                        with self._cadence_diagnostics.macro_action(
+                            "MB1_UP", intended=False
+                        ):
+                            self.mouse_up()
                 except InputApiError as exc:
                     errors.append(str(exc))
             if self._aim_owned:
@@ -304,7 +409,14 @@ class SendInputBackend:
                     errors.append(str(exc))
             if self._reload_owned:
                 try:
-                    self.reload_up()
+                    if self._cadence_diagnostics is None:
+                        self.reload_up()
+                    else:
+                        self._cadence_diagnostics.record_cleanup_release("R_UP")
+                        with self._cadence_diagnostics.macro_action(
+                            "R_UP", intended=False
+                        ):
+                            self.reload_up()
                 except InputApiError as exc:
                     errors.append(str(exc))
         if errors:

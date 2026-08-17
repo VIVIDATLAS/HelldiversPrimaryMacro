@@ -4,9 +4,9 @@ import ctypes
 from ctypes import wintypes
 import os
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from .input_backend import INPUT_MARKER, ULONG_PTR, InputCoordination
+from .input_backend import INPUT_MARKER, VK_R, InputCoordination
 from .models import (
     ControlEvent,
     ControlEventKind,
@@ -15,6 +15,15 @@ from .models import (
     Mb2PairDecision,
     ShiftStroke,
 )
+from .windows_abi import (
+    ULONG_PTR,
+    marker_matches,
+    normalize_ulong_ptr,
+    structure_field_type,
+)
+
+if TYPE_CHECKING:
+    from .cadence_diagnostics import CadenceDiagnostics
 
 
 WH_KEYBOARD_LL = 13
@@ -42,6 +51,7 @@ VK_LSHIFT = 0xA0
 VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
+VK_P = 0x50
 SHIFT_SCAN_CODES = {VK_LSHIFT: 0x2A, VK_RSHIFT: 0x36}
 
 LRESULT = ctypes.c_ssize_t
@@ -73,6 +83,9 @@ def validate_hook_layouts() -> None:
     pointer_size = ctypes.sizeof(ctypes.c_void_p)
     if ctypes.sizeof(ULONG_PTR) != pointer_size:
         raise RuntimeError("hook dwExtraInfo is not pointer-sized")
+    for structure in (KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT):
+        if ctypes.sizeof(structure_field_type(structure, "dwExtraInfo")) != pointer_size:
+            raise RuntimeError(f"{structure.__name__}.dwExtraInfo is not pointer-sized")
     expected_keyboard = 24 if pointer_size == 8 else 20
     expected_mouse = 32 if pointer_size == 8 else 24
     actual = (ctypes.sizeof(KBDLLHOOKSTRUCT), ctypes.sizeof(MSLLHOOKSTRUCT))
@@ -91,12 +104,18 @@ class HookPolicy:
         generated_mouse_owned: Callable[[], bool] = lambda: False,
         coordination: InputCoordination | None = None,
         diagnostics_enabled: bool = False,
+        cadence_diagnostics: CadenceDiagnostics | None = None,
+        fire_device: str = "mouse",
+        fire_scan_code: int | None = None,
     ) -> None:
         self._foreground_status = foreground_status
         self._event_sink = event_sink
         self._generated_mouse_owned = generated_mouse_owned
         self._coordination = coordination or InputCoordination()
         self._diagnostics_enabled = diagnostics_enabled
+        self._cadence_diagnostics = cadence_diagnostics
+        self._fire_device = fire_device
+        self._fire_scan_code = fire_scan_code
         self._keys_down: set[int] = set()
         self._left_pair_decision: Mb1PairDecision | None = None
         self._left_pair_is_manual = False
@@ -136,9 +155,47 @@ class HookPolicy:
         extra_info: int = 0,
     ) -> bool:
         """Observe keys and defer foreground physical Shift pairs."""
-        pointer_mask = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
-        marked = (int(extra_info) & pointer_mask) == (INPUT_MARKER & pointer_mask)
-        if marked or flags & LLKHF_INJECTED:
+        marked = marker_matches(extra_info, INPUT_MARKER)
+        diagnostic_action = None
+        if self._fire_device == "keyboard" and scan_code == self._fire_scan_code:
+            diagnostic_action = (
+                "P_DOWN"
+                if message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                else "P_UP"
+                if message in (WM_KEYUP, WM_SYSKEYUP)
+                else None
+            )
+        elif vk_code == VK_R:
+            diagnostic_action = (
+                "R_DOWN"
+                if message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                else "R_UP"
+                if message in (WM_KEYUP, WM_SYSKEYUP)
+                else None
+            )
+        if (
+            self._cadence_diagnostics is not None
+            and flags & LLKHF_INJECTED
+            and diagnostic_action is not None
+        ):
+            self._cadence_diagnostics.observe_injected_keyboard_event(
+                diagnostic_action,
+                flags,
+                extra_info,
+                marker_matches=marked,
+                injected_flag=LLKHF_INJECTED,
+            )
+        if marked:
+            if self._cadence_diagnostics is not None:
+                if diagnostic_action is not None:
+                    self._cadence_diagnostics.observe_owned_hook_event(
+                        diagnostic_action,
+                        passed=True,
+                        suppressed=False,
+                        routed=False,
+                    )
+            return False
+        if flags & LLKHF_INJECTED:
             return False
         if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
             if vk_code in self._keys_down:
@@ -196,9 +253,34 @@ class HookPolicy:
 
     def mouse(self, message: int, flags: int, extra_info: int) -> bool:
         """Latch one decision for each genuine physical MB1 down/up pair."""
-        pointer_mask = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
-        marked = (int(extra_info) & pointer_mask) == (INPUT_MARKER & pointer_mask)
-        if marked or flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED):
+        marked = marker_matches(extra_info, INPUT_MARKER)
+        if (
+            self._cadence_diagnostics is not None
+            and flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)
+        ):
+            self._cadence_diagnostics.observe_injected_mouse_event(
+                message,
+                flags,
+                extra_info,
+                marker_matches=marked,
+                injected_flag=LLMHF_INJECTED,
+                lower_il_flag=LLMHF_LOWER_IL_INJECTED,
+            )
+        if marked:
+            if self._cadence_diagnostics is not None:
+                action = (
+                    "MB1_DOWN"
+                    if message == WM_LBUTTONDOWN
+                    else "MB1_UP"
+                    if message == WM_LBUTTONUP
+                    else None
+                )
+                if action is not None:
+                    self._cadence_diagnostics.observe_owned_hook_event(
+                        action, passed=True, suppressed=False, routed=False
+                    )
+            return False
+        if flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED):
             return False
 
         if message == WM_RBUTTONDOWN:
@@ -370,11 +452,21 @@ class WindowsHookThread:
     def _call_next(self, code: int, wparam: int, lparam: int) -> int:
         return int(self._user32.CallNextHookEx(None, code, wparam, lparam))
 
+    @staticmethod
+    def _read_mouse_hook_data(lparam: int) -> MSLLHOOKSTRUCT:
+        address = ctypes.c_void_p(normalize_ulong_ptr(lparam))
+        return ctypes.cast(address, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+
+    @staticmethod
+    def _read_keyboard_hook_data(lparam: int) -> KBDLLHOOKSTRUCT:
+        address = ctypes.c_void_p(normalize_ulong_ptr(lparam))
+        return ctypes.cast(address, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+
     def _mouse_proc(self, code: int, wparam: int, lparam: int) -> int:
         if code < HC_ACTION:
             return self._call_next(code, wparam, lparam)
         try:
-            data = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+            data = self._read_mouse_hook_data(lparam)
             if self._policy.mouse(int(wparam), int(data.flags), int(data.dwExtraInfo)):
                 return 1
         except BaseException as exc:
@@ -391,7 +483,7 @@ class WindowsHookThread:
         if code < HC_ACTION:
             return self._call_next(code, wparam, lparam)
         try:
-            data = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            data = self._read_keyboard_hook_data(lparam)
             if self._policy.keyboard(
                 int(wparam),
                 int(data.vkCode),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 import threading
 import unittest
@@ -60,6 +61,12 @@ class RecordingBackend:
         self._event("MB1_UP")
         self.mouse_owned = False
 
+    def fire_down(self) -> None:
+        self.mouse_down()
+
+    def fire_up(self) -> None:
+        self.mouse_up()
+
     def aim_down(self) -> None:
         self.aim_owned = True
         self._event("MB2_DOWN")
@@ -118,6 +125,30 @@ class RecordingBackend:
             self.shift_scan = 0
 
 
+class KeyboardRecordingBackend(RecordingBackend):
+    def __init__(self, fail_on: str | None = None, clock=None) -> None:
+        super().__init__(fail_on=fail_on, clock=clock)
+        self.fire_key_owned = False
+
+    def fire_down(self) -> None:
+        if self.fire_key_owned:
+            raise InputApiError("duplicate P down")
+        self.fire_key_owned = True
+        self._event("P_DOWN")
+
+    def fire_up(self) -> None:
+        if not self.fire_key_owned:
+            return
+        self._event("P_UP")
+        self.fire_key_owned = False
+
+    def release_all(self) -> None:
+        if self.fire_key_owned:
+            self._event("RELEASE_P")
+            self.fire_key_owned = False
+        super().release_all()
+
+
 class FakeTime:
     def __init__(self) -> None:
         self.now = 0.0
@@ -148,36 +179,43 @@ class TrackingLock:
 
 class MacroSequenceTests(unittest.TestCase):
     def test_exact_primary_sequence_and_timing(self) -> None:
-        inter_shot = [
-            CycleStep(OutputAction.MB1_DOWN),
-            CycleStep(OutputAction.WAIT, 35),
-            CycleStep(OutputAction.MB1_UP),
-            CycleStep(OutputAction.WAIT, 50),
-        ]
-        final_shot = [
-            CycleStep(OutputAction.MB1_DOWN),
-            CycleStep(OutputAction.WAIT, 35),
-            CycleStep(OutputAction.MB1_UP),
-        ]
+        primary = CONFIG.primary
         steps = primary_cycle_steps(CONFIG)
-        self.assertEqual(steps[: 44 * 4], inter_shot * 44)
-        self.assertEqual(steps[44 * 4 : 44 * 4 + 3], final_shot)
-        final_up_index = 44 * 4 + 2
-        self.assertIs(steps[final_up_index].action, OutputAction.MB1_UP)
-        self.assertIs(steps[final_up_index + 1].action, OutputAction.R_DOWN)
         self.assertEqual(
-            steps[-4:],
+            steps,
             [
+                CycleStep(OutputAction.FIRE_DOWN),
+                CycleStep(OutputAction.WAIT, primary.automatic_hold_ms),
+                CycleStep(OutputAction.FIRE_UP),
                 CycleStep(OutputAction.R_DOWN),
-                CycleStep(OutputAction.WAIT, 25),
+                CycleStep(OutputAction.WAIT, primary.reload_press_ms),
                 CycleStep(OutputAction.R_UP),
-                CycleStep(OutputAction.WAIT, 2000),
+                CycleStep(OutputAction.WAIT, primary.reload_wait_ms),
             ],
         )
-        self.assertEqual(sum(step.duration_ms for step in steps), 5800)
+        expected_duration = (
+            primary.automatic_hold_ms
+            + primary.post_fire_reload_delay_ms
+            + primary.reload_press_ms
+            + primary.reload_wait_ms
+        )
+        self.assertEqual(sum(step.duration_ms for step in steps), expected_duration)
+
+    def test_nonzero_primary_post_fire_reload_delay_is_honored(self) -> None:
+        from dataclasses import replace
+
+        config = replace(
+            CONFIG,
+            primary=replace(CONFIG.primary, post_fire_reload_delay_ms=17),
+        )
+        steps = primary_cycle_steps(config)
         self.assertEqual(
-            sum(step == CycleStep(OutputAction.WAIT, 50) for step in steps),
-            44,
+            steps[2:5],
+            [
+                CycleStep(OutputAction.FIRE_UP),
+                CycleStep(OutputAction.WAIT, 17),
+                CycleStep(OutputAction.R_DOWN),
+            ],
         )
 
     def test_primary_runtime_emits_exact_clicks_and_reload_timing(self) -> None:
@@ -206,40 +244,155 @@ class MacroSequenceTests(unittest.TestCase):
         )
 
         self.assertTrue(result.canceled)
+        primary = CONFIG.primary
+        final_down_ms = 0
+        final_up_ms = primary.automatic_hold_ms
+        reload_up_ms = final_up_ms + primary.reload_press_ms
+        completed_ms = reload_up_ms + primary.reload_wait_ms
         downs = [at for name, at in backend.timed_events if name == "MB1_DOWN"]
         ups = [at for name, at in backend.timed_events if name == "MB1_UP"]
-        self.assertEqual(len(downs), 45)
-        self.assertEqual(len(ups), 45)
-        self.assertEqual([up - down for down, up in zip(downs, ups)], [35] * 45)
-        self.assertEqual(
-            [later - earlier for earlier, later in zip(downs, downs[1:])],
-            [85] * 44,
-        )
-        self.assertEqual(
-            [next_down - up for up, next_down in zip(ups, downs[1:])],
-            [50] * 44,
-        )
+        self.assertEqual(downs, [0])
+        self.assertEqual(ups, [primary.automatic_hold_ms])
         self.assertTrue(all(down < up for down, up in zip(downs, ups)))
         self.assertEqual(
             [name for name, _at in backend.timed_events],
-            ["MB1_DOWN", "MB1_UP"] * 45 + ["R_DOWN", "R_UP"],
+            ["MB1_DOWN", "MB1_UP", "R_DOWN", "R_UP"],
         )
         self.assertEqual(
             backend.timed_events[-2:],
-            [("R_DOWN", 3775), ("R_UP", 3800)],
+            [("R_DOWN", final_up_ms), ("R_UP", reload_up_ms)],
         )
-        self.assertEqual(downs[-1], 3740)
-        self.assertEqual(ups[-1], 3775)
+        self.assertEqual(downs[-1], final_down_ms)
+        self.assertEqual(ups[-1], final_up_ms)
         self.assertEqual(backend.timed_events[-2][1] - ups[-1], 0)
         self.assertEqual(final_up_observed_after_r_down, [True])
         self.assertEqual(
             [round(update.occurred_at * 1000) for update in progress if update.phase is WorkerProgress.RELOAD_COMPLETED],
-            [5800],
+            [completed_ms],
         )
         self.assertEqual(
             sum(update.phase is WorkerProgress.SHOT_BEGAN for update in progress),
-            45,
+            1,
         )
+
+    def test_keyboard_fire_channel_emits_p_pairs_with_unchanged_timing(self) -> None:
+        for mode, weapon in (
+            (WeaponMode.PRIMARY, CONFIG.primary),
+            (WeaponMode.SECONDARY, CONFIG.secondary),
+        ):
+            with self.subTest(mode=mode):
+                fake_time = FakeTime()
+                backend = KeyboardRecordingBackend(clock=fake_time.clock)
+                cancel = threading.Event()
+
+                def progress(update: WorkerProgressUpdate) -> None:
+                    if update.phase is WorkerProgress.RELOAD_COMPLETED:
+                        cancel.set()
+
+                result = MacroEngine(
+                    CONFIG,
+                    backend,
+                    lambda: True,
+                    clock=fake_time.clock,
+                    wait=fake_time.wait,
+                ).run_macro(mode, cancel, threading.Event(), progress)
+
+                self.assertTrue(result.canceled)
+                names = [name for name, _at in backend.timed_events]
+                expected_pairs = (
+                    1 if weapon.fire_mode == "automatic_hold" else weapon.shots_per_cycle
+                )
+                self.assertEqual(names, ["P_DOWN", "P_UP"] * expected_pairs + ["R_DOWN", "R_UP"])
+                self.assertNotIn("MB1_DOWN", names)
+                downs = [at for name, at in backend.timed_events if name == "P_DOWN"]
+                ups = [at for name, at in backend.timed_events if name == "P_UP"]
+                self.assertEqual(
+                    [up - down for down, up in zip(downs, ups)],
+                    [
+                        weapon.automatic_hold_ms
+                        if weapon.fire_mode == "automatic_hold"
+                        else weapon.fire_press_ms
+                    ] * expected_pairs,
+                )
+                if weapon.fire_mode == "tap":
+                    self.assertEqual(
+                        [later - earlier for earlier, later in zip(downs, downs[1:])],
+                        [weapon.shot_period_ms] * (expected_pairs - 1),
+                    )
+                reload_down = next(
+                    at for name, at in backend.timed_events if name == "R_DOWN"
+                )
+                self.assertEqual(reload_down, ups[-1])
+                self.assertFalse(backend.fire_key_owned)
+
+    def test_keyboard_fire_cancellation_releases_p_without_reload(self) -> None:
+        fake_time = FakeTime()
+        backend = KeyboardRecordingBackend(clock=fake_time.clock)
+        cancel = threading.Event()
+
+        def wait(event: threading.Event, seconds: float) -> bool:
+            fake_time.wait(event, seconds)
+            if fake_time.now >= 0.005:
+                cancel.set()
+            return cancel.is_set()
+
+        result = MacroEngine(
+            CONFIG,
+            backend,
+            lambda: True,
+            clock=fake_time.clock,
+            wait=wait,
+        ).run_macro(WeaponMode.PRIMARY, cancel, threading.Event())
+
+        self.assertTrue(result.canceled)
+        self.assertEqual(backend.events, ["P_DOWN", "RELEASE_P"])
+        self.assertFalse(backend.fire_key_owned)
+        self.assertNotIn("R_DOWN", backend.events)
+
+    def test_keyboard_fire_cancellation_during_release_and_reload_is_safe(self) -> None:
+        for cancel_at_ms, expected_tail, expect_reload in (
+            (30, ["P_DOWN", "RELEASE_P"], False),
+            (4460, ["R_DOWN", "RELEASE_R"], True),
+        ):
+            with self.subTest(cancel_at_ms=cancel_at_ms):
+                fake_time = FakeTime()
+                backend = KeyboardRecordingBackend(clock=fake_time.clock)
+                cancel = threading.Event()
+
+                def wait(event: threading.Event, seconds: float) -> bool:
+                    fake_time.wait(event, seconds)
+                    if fake_time.now * 1000 >= cancel_at_ms:
+                        cancel.set()
+                    return cancel.is_set()
+
+                result = MacroEngine(
+                    CONFIG,
+                    backend,
+                    lambda: True,
+                    clock=fake_time.clock,
+                    wait=wait,
+                ).run_macro(WeaponMode.PRIMARY, cancel, threading.Event())
+
+                self.assertTrue(result.canceled)
+                self.assertEqual(backend.events[-len(expected_tail) :], expected_tail)
+                self.assertFalse(backend.fire_key_owned)
+                self.assertEqual("R_DOWN" in backend.events, expect_reload)
+
+    def test_retired_preparation_cleanup_cannot_release_current_p(self) -> None:
+        backend = KeyboardRecordingBackend()
+        backend.fire_key_owned = True
+        cancel = threading.Event()
+        cancel.set()
+        result = MacroEngine(CONFIG, backend, lambda: True).prepare_reload(
+            WeaponMode.PRIMARY,
+            500,
+            cancel,
+            threading.Event(),
+        )
+        self.assertTrue(result.canceled)
+        self.assertTrue(backend.fire_key_owned)
+        self.assertNotIn("P_UP", backend.events)
+        self.assertNotIn("RELEASE_P", backend.events)
 
     def _run_primary_canceled_at(
         self, cancel_at_ms: int
@@ -279,35 +432,27 @@ class MacroSequenceTests(unittest.TestCase):
         )
         self.assertFalse(backend.mouse_owned)
 
-    def test_cancel_during_primary_up_interval_stops_shots_and_reload(self) -> None:
-        backend, result, _progress = self._run_primary_canceled_at(40)
+    def test_cancel_late_in_primary_hold_stops_without_reload(self) -> None:
+        backend, result, _progress = self._run_primary_canceled_at(4400)
         self.assertTrue(result.canceled)
-        self.assertEqual(backend.events, ["MB1_DOWN", "MB1_UP"])
-        self.assertNotIn("R_DOWN", backend.events)
-
-    def test_cancel_after_primary_shot_44_prevents_shot_45_and_reload(self) -> None:
-        backend, result, _progress = self._run_primary_canceled_at(3695)
-        self.assertTrue(result.canceled)
-        self.assertEqual(backend.events.count("MB1_DOWN"), 44)
-        self.assertEqual(backend.events.count("MB1_UP"), 44)
-        self.assertNotIn("R_DOWN", backend.events)
-
-    def test_cancel_during_final_primary_down_releases_mb1_and_prevents_reload(self) -> None:
-        backend, result, _progress = self._run_primary_canceled_at(3745)
-        self.assertTrue(result.canceled)
-        self.assertEqual(backend.events.count("MB1_DOWN"), 45)
-        self.assertEqual(backend.events.count("MB1_UP"), 44)
-        self.assertEqual(backend.events[-1], "RELEASE_MB1")
+        self.assertEqual(backend.events, ["MB1_DOWN", "RELEASE_MB1"])
         self.assertNotIn("R_DOWN", backend.events)
 
     def test_cancel_during_primary_reload_down_releases_r(self) -> None:
-        backend, result, _progress = self._run_primary_canceled_at(3780)
+        primary = CONFIG.primary
+        reload_down_ms = primary.automatic_hold_ms + primary.post_fire_reload_delay_ms
+        backend, result, _progress = self._run_primary_canceled_at(
+            reload_down_ms + 5
+        )
         self.assertTrue(result.canceled)
         self.assertEqual(backend.events[-2:], ["R_DOWN", "RELEASE_R"])
         self.assertFalse(backend.reload_owned)
 
     def test_cancel_during_primary_reload_wait_prevents_full_progress(self) -> None:
-        backend, result, progress = self._run_primary_canceled_at(3805)
+        primary = CONFIG.primary
+        reload_up_ms = primary.automatic_hold_ms + primary.post_fire_reload_delay_ms + primary.reload_press_ms
+        cancel_at_ms = reload_up_ms + 5
+        backend, result, progress = self._run_primary_canceled_at(cancel_at_ms)
         self.assertTrue(result.canceled)
         self.assertEqual(backend.events[-2:], ["R_DOWN", "R_UP"])
         self.assertNotIn(
@@ -320,21 +465,21 @@ class MacroSequenceTests(unittest.TestCase):
             if update.phase is WorkerProgress.RELOAD_FAILED
         ]
         self.assertEqual(len(failed), 1)
-        self.assertEqual(round(failed[0].occurred_at * 1000), 3805)
+        self.assertEqual(round(failed[0].occurred_at * 1000), cancel_at_ms)
         self.assertIn("canceled", failed[0].reason)
 
     def test_exact_secondary_sequence_and_timing(self) -> None:
         steps = secondary_cycle_steps(CONFIG)
         inter_shot = [
-            CycleStep(OutputAction.MB1_DOWN),
+            CycleStep(OutputAction.FIRE_DOWN),
             CycleStep(OutputAction.WAIT, 35),
-            CycleStep(OutputAction.MB1_UP),
+            CycleStep(OutputAction.FIRE_UP),
             CycleStep(OutputAction.WAIT, 85),
         ]
         final_shot = [
-            CycleStep(OutputAction.MB1_DOWN),
+            CycleStep(OutputAction.FIRE_DOWN),
             CycleStep(OutputAction.WAIT, 35),
-            CycleStep(OutputAction.MB1_UP),
+            CycleStep(OutputAction.FIRE_UP),
         ]
         self.assertEqual(steps[: 12 * 4], inter_shot * 12)
         self.assertEqual(steps[12 * 4 : 12 * 4 + 3], final_shot)
@@ -636,6 +781,20 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertLessEqual(max(fake_time.waits), 0.005)
         self.assertFalse(backend.mouse_owned)
 
+    def test_macro_cycle_uses_relative_steps_without_rebasing_or_catch_up(self) -> None:
+        source = inspect.getsource(MacroEngine.run_macro)
+        for abandoned_scheduler_term in (
+            "cycle_origin",
+            "shot_deadline",
+            "lateness",
+            "rebase",
+            "catch_up",
+            "perf_counter_ns",
+        ):
+            self.assertNotIn(abandoned_scheduler_term, source)
+        self.assertIn("primary_cycle_steps", source)
+        self.assertIn("self._cancelable_wait", source)
+
     def test_reload_preparation_succeeds_only_after_complete_wait(self) -> None:
         backend = RecordingBackend()
         fake_time = FakeTime()
@@ -691,6 +850,25 @@ class MacroSequenceTests(unittest.TestCase):
         worker.cancel()
         self.assertTrue(worker.cancel_event.is_set())
         self.assertFalse(engine.io_lock.held)
+
+    def test_shift_or_rmb_stop_releases_owned_p_without_starting_reload(self) -> None:
+        backend = KeyboardRecordingBackend()
+        backend.fire_key_owned = True
+        worker = MacroWorker(
+            1,
+            WorkerRequest(WorkerKind.MACRO, WeaponMode.PRIMARY),
+            MacroEngine(CONFIG, backend, lambda: True),
+            threading.Event(),
+            lambda _token, _result: None,
+            lambda _token, _progress: None,
+        )
+
+        preserved_reload = worker.sprint_stop()
+
+        self.assertFalse(preserved_reload)
+        self.assertEqual(backend.events, ["RELEASE_P"])
+        self.assertFalse(backend.fire_key_owned)
+        self.assertNotIn("R_DOWN", backend.events)
 
     def test_retired_preparation_cleanup_cannot_release_macro_mouse(self) -> None:
         backend = RecordingBackend()
@@ -789,9 +967,18 @@ class MacroSequenceTests(unittest.TestCase):
         )
         self.assertTrue(result.canceled)
         phases = [update.phase for update in progress]
-        self.assertEqual(phases.count(WorkerProgress.SHOT_BEGAN), 45)
+        self.assertEqual(
+            phases.count(WorkerProgress.SHOT_BEGAN),
+            1,
+        )
         self.assertEqual(phases[-1], WorkerProgress.RELOAD_COMPLETED)
-        self.assertAlmostEqual(fake_time.now, 5.800, places=3)
+        expected_ms = (
+            CONFIG.primary.automatic_hold_ms
+            + CONFIG.primary.post_fire_reload_delay_ms
+            + CONFIG.primary.reload_press_ms
+            + CONFIG.primary.reload_wait_ms
+        )
+        self.assertAlmostEqual(fake_time.now, expected_ms / 1000, places=3)
 
     def test_shift_preserves_reload_in_a_later_macro_cycle(self) -> None:
         backend = RecordingBackend()

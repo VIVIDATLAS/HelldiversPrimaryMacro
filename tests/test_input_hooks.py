@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import ctypes
 import unittest
 
 from helldivers_macro.input_backend import INPUT_MARKER, InputCoordination
+from helldivers_macro.cadence_diagnostics import CadenceDiagnostics
 from helldivers_macro.input_hooks import (
     HookPolicy,
     LLKHF_INJECTED,
     LLMHF_INJECTED,
+    LLMHF_LOWER_IL_INJECTED,
+    KBDLLHOOKSTRUCT,
+    MSLLHOOKSTRUCT,
+    WindowsHookThread,
     VK_1,
     VK_2,
     VK_LCONTROL,
     VK_LSHIFT,
+    VK_P,
     VK_RSHIFT,
     SHIFT_SCAN_CODES,
     VK_NUMPAD1,
@@ -24,6 +31,11 @@ from helldivers_macro.input_hooks import (
     validate_hook_layouts,
 )
 from helldivers_macro.models import ControlEventKind, ShiftStroke
+from helldivers_macro.windows_abi import (
+    ULONG_PTR,
+    marker_matches,
+    structure_field_type,
+)
 
 
 class HookPolicyTests(unittest.TestCase):
@@ -37,6 +49,80 @@ class HookPolicyTests(unittest.TestCase):
 
     def test_pointer_sized_hook_layouts_are_valid(self) -> None:
         validate_hook_layouts()
+        self.assertEqual(ctypes.sizeof(ctypes.c_void_p), 8)
+        self.assertIs(structure_field_type(KBDLLHOOKSTRUCT, "dwExtraInfo"), ULONG_PTR)
+        self.assertIs(structure_field_type(MSLLHOOKSTRUCT, "dwExtraInfo"), ULONG_PTR)
+        self.assertEqual(
+            ctypes.sizeof(structure_field_type(MSLLHOOKSTRUCT, "dwExtraInfo")),
+            ctypes.sizeof(ctypes.c_void_p),
+        )
+        self.assertEqual(ctypes.sizeof(KBDLLHOOKSTRUCT), 24)
+        self.assertEqual(ctypes.alignment(KBDLLHOOKSTRUCT), 8)
+        self.assertEqual(KBDLLHOOKSTRUCT.dwExtraInfo.offset, 16)
+        self.assertEqual(ctypes.sizeof(MSLLHOOKSTRUCT), 32)
+        self.assertEqual(ctypes.alignment(MSLLHOOKSTRUCT), 8)
+        self.assertEqual(MSLLHOOKSTRUCT.dwExtraInfo.offset, 24)
+
+    def test_canonical_marker_survives_mouse_and_keyboard_hook_dereference(self) -> None:
+        mouse = MSLLHOOKSTRUCT()
+        mouse.dwExtraInfo = INPUT_MARKER
+        mouse_lparam = ctypes.cast(ctypes.pointer(mouse), ctypes.c_void_p).value
+        keyboard = KBDLLHOOKSTRUCT()
+        keyboard.dwExtraInfo = INPUT_MARKER
+        keyboard_lparam = ctypes.cast(ctypes.pointer(keyboard), ctypes.c_void_p).value
+
+        observed_mouse = WindowsHookThread._read_mouse_hook_data(mouse_lparam)
+        observed_keyboard = WindowsHookThread._read_keyboard_hook_data(keyboard_lparam)
+
+        self.assertEqual(INPUT_MARKER, 0x43524F31)
+        self.assertEqual(int(observed_mouse.dwExtraInfo), INPUT_MARKER)
+        self.assertEqual(int(observed_keyboard.dwExtraInfo), INPUT_MARKER)
+        self.assertTrue(marker_matches(observed_mouse.dwExtraInfo, INPUT_MARKER))
+        self.assertTrue(marker_matches(observed_keyboard.dwExtraInfo, INPUT_MARKER))
+        self.assertFalse(marker_matches(0x12345678, INPUT_MARKER))
+
+    def test_owned_generated_p_passes_without_controller_routing(self) -> None:
+        diagnostics = CadenceDiagnostics(
+            primary_shots_per_cycle=1,
+            fire_device="keyboard",
+            clock_ns=lambda: 1,
+        )
+        self.status = (True, True)
+        self.events = []
+        policy = HookPolicy(
+            lambda: self.status,
+            self.events.append,
+            cadence_diagnostics=diagnostics,
+            fire_device="keyboard",
+            fire_scan_code=0x19,
+        )
+        diagnostics.macro_worker_started("PRIMARY")
+        for action, message in (("P_DOWN", WM_KEYDOWN), ("P_UP", WM_KEYUP)):
+            with diagnostics.macro_action(action):
+                expected = diagnostics.send_requested()
+            self.assertFalse(
+                policy.keyboard(
+                    message,
+                    VK_P,
+                    LLKHF_INJECTED,
+                    0x19,
+                    INPUT_MARKER,
+                )
+            )
+            diagnostics.send_completed(expected, 1, 0)
+        data = diagnostics.snapshot()
+        self.assertEqual(data["hook_observed"]["P_DOWN"], 1)
+        self.assertEqual(data["hook_observed"]["P_UP"], 1)
+        self.assertEqual(data["hook_passed"], data["hook_observed"])
+        self.assertEqual(sum(data["hook_suppressed"].values()), 0)
+        self.assertEqual(sum(data["hook_routed"].values()), 0)
+        self.assertEqual(self.events, [])
+
+    def test_physical_p_passes_without_macro_event(self) -> None:
+        policy = self.make_policy()
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_P, 0, 0x19, 0))
+        self.assertFalse(policy.keyboard(WM_KEYUP, VK_P, 0, 0x19, 0))
+        self.assertEqual(self.events, [])
 
     def test_number_row_selection_passes_and_ignores_repeat(self) -> None:
         policy = self.make_policy()
@@ -200,6 +286,40 @@ class HookPolicyTests(unittest.TestCase):
             ):
                 self.assertFalse(policy.mouse(down, flags, marker))
                 self.assertFalse(policy.mouse(up, flags, marker))
+        self.assertEqual(self.events, [])
+
+    def test_owned_generated_mb1_is_observed_passed_and_never_routed(self) -> None:
+        diagnostics = CadenceDiagnostics(clock_ns=lambda: 1)
+        self.status = (True, True)
+        self.events = []
+        policy = HookPolicy(
+            lambda: self.status,
+            self.events.append,
+            cadence_diagnostics=diagnostics,
+        )
+        diagnostics.macro_worker_started("PRIMARY")
+        for action, message in (
+            ("MB1_DOWN", WM_LBUTTONDOWN),
+            ("MB1_UP", WM_LBUTTONUP),
+        ):
+            with diagnostics.macro_action(action):
+                expected = diagnostics.send_requested()
+            diagnostics.send_completed(expected, 1, 0)
+            self.assertFalse(
+                policy.mouse(
+                    message,
+                    LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED,
+                    INPUT_MARKER,
+                )
+            )
+        diagnostics.macro_worker_stopped()
+
+        data = diagnostics.snapshot()
+        self.assertEqual(data["hook_observed"]["MB1_DOWN"], 1)
+        self.assertEqual(data["hook_observed"]["MB1_UP"], 1)
+        self.assertEqual(data["hook_passed"], data["hook_observed"])
+        self.assertEqual(sum(data["hook_suppressed"].values()), 0)
+        self.assertEqual(sum(data["hook_routed"].values()), 0)
         self.assertEqual(self.events, [])
 
     def test_outside_target_mb1_always_passes(self) -> None:

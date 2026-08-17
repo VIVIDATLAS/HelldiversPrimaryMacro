@@ -10,9 +10,10 @@ import time
 from typing import Sequence
 
 from .audio import AudioNotifier
+from .cadence_diagnostics import CadenceDiagnostics
 from .config import AppConfig, ConfigError, load_config
 from .foreground import ForegroundCache, ForegroundMonitor, WindowsForegroundInspector
-from .input_backend import InputCoordination, SendInputBackend
+from .input_backend import INPUT_MARKER, InputCoordination, SendInputBackend
 from .input_hooks import HookPolicy, WindowsHookThread
 from .macro_engine import (
     MacroEngine,
@@ -31,6 +32,7 @@ from .models import (
     WorkerResult,
 )
 from .state_machine import MacroStateMachine
+from .timer_resolution import TimerResolutionError, WindowsTimerResolution
 
 
 LOGGER = logging.getLogger(__name__)
@@ -99,17 +101,71 @@ def _worker_factory(
     return create
 
 
-def run_live(config: AppConfig) -> int:
+def run_live(config: AppConfig, *, cadence_diagnostics: bool = False) -> int:
     """The only command path authorized to install hooks or generate input."""
     ensure_windows_11_pro()
+    timer_resolution: WindowsTimerResolution | None = None
+    try:
+        try:
+            candidate = WindowsTimerResolution(1)
+            candidate.acquire()
+            timer_resolution = candidate
+        except (OSError, TimerResolutionError, ValueError) as exc:
+            print(
+                "Warning: 1 ms Windows timer resolution unavailable; "
+                f"using the default wait resolution ({exc}).",
+                file=sys.stderr,
+            )
+        return _run_live_session(
+            config,
+            cadence_diagnostics=cadence_diagnostics,
+        )
+    finally:
+        if timer_resolution is not None:
+            try:
+                timer_resolution.release()
+            except TimerResolutionError as exc:
+                print(
+                    f"Warning: could not release 1 ms Windows timer resolution ({exc}).",
+                    file=sys.stderr,
+                )
+
+
+def _run_live_session(
+    config: AppConfig,
+    *,
+    cadence_diagnostics: bool = False,
+) -> int:
     event_queue: queue.Queue[ControlEvent] = queue.Queue()
     shutdown_event = threading.Event()
     audio = AudioNotifier(config.audio)
     cache = ForegroundCache(config.target.foreground_cache_max_age_ms)
     inspector = WindowsForegroundInspector(config.target.executable)
-    backend = SendInputBackend()
+    diagnostics = (
+        CadenceDiagnostics(
+            primary_shots_per_cycle=(
+                1
+                if config.primary.fire_mode == "automatic_hold"
+                else config.primary.shots_per_cycle
+            ),
+            primary_fire_mode=config.primary.fire_mode,
+            ownership_marker=INPUT_MARKER,
+            fire_device=config.output.fire_device,
+        )
+        if cadence_diagnostics
+        else None
+    )
+    backend = SendInputBackend(
+        cadence_diagnostics=diagnostics,
+        output=config.output,
+    )
     coordination = InputCoordination()
-    engine = MacroEngine(config, backend, cache.is_confirmed_active)
+    engine = MacroEngine(
+        config,
+        backend,
+        cache.is_confirmed_active,
+        cadence_diagnostics=diagnostics,
+    )
     machine = MacroStateMachine(
         config,
         cache.is_confirmed_active,
@@ -151,6 +207,9 @@ def run_live(config: AppConfig) -> int:
         backend.mouse_owned_snapshot,
         coordination,
         config.diagnostics.ctrl_bypass_logging,
+        cadence_diagnostics=diagnostics,
+        fire_device=config.output.fire_device,
+        fire_scan_code=config.output.fire_scan_code,
     )
     hooks = WindowsHookThread(policy, event_queue.put_nowait)
     audio_started = False
@@ -178,21 +237,25 @@ def run_live(config: AppConfig) -> int:
         print("Ctrl+C received; stopping safely.")
         return 0
     finally:
-        # Stop generation first. The worker's cancel-and-release lock prevents a
-        # new generated down from racing after this release operation.
-        if audio_started:
-            machine.shutdown()
-        shutdown_event.set()
-        if hooks_started:
-            hooks.stop()
-        if monitor_started:
-            monitor.join(2.0)
         try:
-            backend.release_all()
-        except Exception:
-            LOGGER.exception("final generated-input release failed")
-        if audio_started:
-            audio.stop(drain=True)
+            # Stop generation first. The worker's cancel-and-release lock prevents a
+            # new generated down from racing after this release operation.
+            if audio_started:
+                machine.shutdown()
+            shutdown_event.set()
+            if hooks_started:
+                hooks.stop()
+            if monitor_started:
+                monitor.join(2.0)
+            try:
+                backend.release_all()
+            except Exception:
+                LOGGER.exception("final generated-input release failed")
+            if audio_started:
+                audio.stop(drain=True)
+        finally:
+            if diagnostics is not None:
+                print(diagnostics.format_summary())
 
 
 def identify_foreground(config: AppConfig, delay: float) -> int:
@@ -213,7 +276,12 @@ def identify_foreground(config: AppConfig, delay: float) -> int:
     return 0 if observation.certain else 1
 
 
-def _format_dry_run(name: str, steps: list[CycleStep]) -> str:
+def _format_dry_run(
+    name: str,
+    steps: list[CycleStep],
+    *,
+    fire_device: str,
+) -> str:
     lines = [f"{name} dry-run (no hooks, input, suppression, or audio):"]
     elapsed = 0
     for index, step in enumerate(steps, start=1):
@@ -224,7 +292,18 @@ def _format_dry_run(name: str, steps: list[CycleStep]) -> str:
             )
             elapsed += step.duration_ms
         else:
-            lines.append(f"{index:02d}. {step.action.value} (elapsed {elapsed} ms)")
+            label = step.action.value
+            if fire_device == "keyboard":
+                if step.action is OutputAction.FIRE_DOWN:
+                    label = "P_DOWN"
+                elif step.action is OutputAction.FIRE_UP:
+                    label = "P_UP"
+            elif fire_device == "mouse":
+                if step.action is OutputAction.FIRE_DOWN:
+                    label = "MB1_DOWN"
+                elif step.action is OutputAction.FIRE_UP:
+                    label = "MB1_UP"
+            lines.append(f"{index:02d}. {label} (elapsed {elapsed} ms)")
     lines.append(f"Cycle duration: {elapsed} ms")
     return "\n".join(lines)
 
@@ -267,6 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--test-audio", action="store_true")
     modes.add_argument("--live", action="store_true")
     parser.add_argument(
+        "--cadence-diagnostics",
+        action="store_true",
+        help="collect bounded owned fire/R delivery data for --live",
+    )
+    parser.add_argument(
         "--delay",
         type=float,
         default=5.0,
@@ -278,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cadence_diagnostics and not args.live:
+        parser.error("--cadence-diagnostics requires --live")
     if not any(
         (
             args.check_config,
@@ -300,17 +386,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.identify_foreground:
             return identify_foreground(config, args.delay)
         if args.dry_run_primary_cycle:
-            print(_format_dry_run("PRIMARY", primary_cycle_steps(config)))
+            print(
+                _format_dry_run(
+                    "PRIMARY",
+                    primary_cycle_steps(config),
+                    fire_device=config.output.fire_device,
+                )
+            )
             return 0
         if args.dry_run_secondary_cycle:
-            print(_format_dry_run("SECONDARY", secondary_cycle_steps(config)))
+            print(
+                _format_dry_run(
+                    "SECONDARY",
+                    secondary_cycle_steps(config),
+                    fire_device=config.output.fire_device,
+                )
+            )
             return 0
         if args.simulate_session:
             return simulate_session(config)
         if args.test_audio:
             return test_audio(config)
         if args.live:
-            return run_live(config)
+            return run_live(config, cadence_diagnostics=args.cadence_diagnostics)
     except (ConfigError, OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

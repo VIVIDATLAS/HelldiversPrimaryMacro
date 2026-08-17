@@ -13,27 +13,42 @@ deferred-bypass, deferred RMB-off, and Shift transitions. Audio notifications
 have their own queue/thread.
 `simulation.py` provides deterministic end-to-end sessions using only fake OS
 boundaries, input, clock/waiting, workers, and audio.
+`cadence_diagnostics.py` provides bounded opt-in one-cycle PRIMARY correlation
+across the worker, `SendInput`, and hooks. In automatic mode it freezes after
+one configured MB1 hold pair and the first R pair, measures backend dispatch
+independently of hook visibility, and
+groups missing observations by device/action. It also retains bounded configured
+fire/R flags and marker metadata, never cursor or physical
+input. It is
+disabled unless `--live --cadence-diagnostics` is explicitly supplied,
+performs no hook-side I/O or waiting, and prints only after shutdown.
+`windows_abi.py` owns the canonical unsigned pointer-width `ULONG_PTR` used by
+both generated input and low-level hook structures. Live mode alone holds a
+reference-counted 1 ms `timeBeginPeriod` lease from before component startup
+until all live cleanup completes; all exit and partial-start paths attempt the
+matching `timeEndPeriod`. Failure is reported once and falls back to the
+default timer resolution. Relative interruptible shot waits remain unchanged;
+there is no absolute-deadline rebasing or catch-up output.
 
-PRIMARY is a configurable 45-shot semi-automatic rifle profile. Helldivers must
-be configured to semi-automatic manually; the macro does not change firing
-mode. Its current cadence is an 85 ms period with MB1 down for 35 ms and a
-50 ms release interval only between consecutive shots. After shot 45,
-final MB1-up and R-down are consecutive under one short I/O boundary with no
-post-shot wait. The tactical-reload strategy
-assumes the user manually starts with 46 rounds, fires 45, leaves one chambered,
-and reloads back to 46. Immediate first activation can begin from an unknown or
-partial magazine because ammunition, ignored inputs, empty reserves, and
-interrupted reloads are not observable. During later rate calibration, change
-only `primary.shot_period_ms` in `config.toml`.
+PRIMARY is an automatic-hold rifle profile. Physical MB1 remains the macro
+toggle, while active `[output]` uses ownership-tagged generated MB1. Helldivers
+Fire stays bound to MB1 and the weapon must be placed in Automatic manually.
+One natural cycle holds MB1 for `automatic_hold_ms = 4450`, releases it, sends
+R immediately when `post_fire_reload_delay_ms = 0`, presses R for 25 ms, waits
+2,000 ms, and completes at 6,475 ms. The tactical strategy assumes a manual
+46-round start and expects the game's automatic cadence to consume 45 rounds
+before the 46th; ammunition and muzzle events are not observable, so calibrate
+only `primary.automatic_hold_ms` after manual live observation.
 
-SECONDARY is 13 shots at a 120 ms period with MB1 down for 35 ms and an 85 ms
-release interval only between consecutive shots. Its final MB1-up and R-down
+SECONDARY is tap mode: 13 shots at a 120 ms period with generated MB1 down for
+35 ms and an 85 ms release interval only between consecutive shots. Its final
+MB1-up and R-down
 are consecutive with no post-shot wait; its configured complete cycle is
 3,500 ms. Macro activation requires confirmed foreground ownership and known
 `AIM_ON`; unmodified MB1 is suppressed but rejected without output or audio
 from `AIM_OFF`/`UNKNOWN`. Idle physical MB2 passes through while the controller
 tracks only an assumed toggle-aim state. During published firing, physical MB2
-is pair-latched and deferred so firing cleanup and owned MB1-up complete before
+is pair-latched and deferred so firing cleanup and owned fire-up complete before
 one tagged MB2 pair turns aim off. That transaction never emits Shift or R.
 The controller invariant is `enabled or firing -> AIM_ON`; any observed or
 committed departure from `AIM_ON` disables current firing.
@@ -44,7 +59,7 @@ new physical foreground MB2-down explicitly resynchronizes `UNKNOWN` to
 `UNKNOWN` generates no MB2 and conservatively normalizes aim to `AIM_OFF`.
 Foreground physical Shift pairs are pair-latched,
 suppressed, and replayed once with the same Left/Right scan code. Active firing
-is disabled and owned MB1 is released before conditional aim-off; a tagged MB2
+is disabled and owned generated MB1 is released before conditional aim-off; a tagged MB2
 pair is generated only from `AIM_ON`, and its up precedes replayed Shift-down.
 `AIM_OFF` and `UNKNOWN` never generate MB2. Shift never initiates reload work.
 An already-active reload may finish while sprinting. When
@@ -75,13 +90,13 @@ Do not run `--test-audio` or `--live` during automated development or tests.
 Definition of done: configuration validates before hooks; target ownership is
 fresh and certain for suppression/execution; Ctrl state is updated synchronously
 in the keyboard hook; every MB1 pair latches one explicit decision; deferred
-bypass output follows generated MB1-up; injected events cannot control the
+bypass output follows generated fire-up; injected events cannot control the
 macro; at most one macro worker; `FULL` is set only by verified reload completion;
 same-mode duplicate selections preserve the active generation; background
 preparation ends armed/FULL or idle/UNKNOWN unless immediate MB1 invalidates it;
 immediate fire never waits for preparation; ON/OFF transitions are deduplicated; audio test shutdown drains
-accepted tones and exposes worker failures; all owned MB1/MB2/Shift/R downs are released
-on every exit; MB1-down is the only toggle edge and MB1-up is cleanup-only;
+accepted tones and exposes worker failures; all owned fire/MB1-bypass/MB2/Shift/R downs are released
+on every exit; physical MB1-down is the only toggle edge and physical MB1-up is cleanup-only;
 same-mode selection cannot mutate macro state; idle MB2 only updates inferred
 aim, while firing MB2 disables before aim-off replay and never emits Shift/R;
 Ctrl cannot restart canceled work; foreground regain requires neutral physical

@@ -558,7 +558,7 @@ class MacroStateMachine:
                 cleanup_trace_event,
                 source=source,
                 previous=disabled_previous,
-                reason="owned MB1 was released before deferred RMB replay",
+                reason="owned fire input was released before deferred RMB replay",
             )
         self._finish_off()
         return cleanup_safe
@@ -961,7 +961,7 @@ class MacroStateMachine:
                 source=source,
                 previous=previous,
                 reason=(
-                    "owned MB1 cleanup failed before deferred RMB replay"
+                    "owned fire-input cleanup failed before deferred RMB replay"
                     if not cleanup_safe
                     else "captured firing authority no longer had known AIM_ON"
                 ),
@@ -1110,7 +1110,7 @@ class MacroStateMachine:
                 "SHIFT_TRANSACTION_FAILED",
                 source=source,
                 previous=previous,
-                reason="owned MB1 could not be released before Shift replay",
+                reason="owned fire input could not be released before Shift replay",
             )
             return
 

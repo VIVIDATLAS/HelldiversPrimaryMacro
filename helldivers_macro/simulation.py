@@ -124,6 +124,12 @@ class FakeGeneratedInput:
             self._record("MB1_UP")
             self.mouse_owned = False
 
+    def fire_down(self) -> None:
+        self.mouse_down()
+
+    def fire_up(self) -> None:
+        self.mouse_up()
+
     def aim_down(self) -> None:
         if self.aim_owned:
             raise RuntimeError("fake duplicate MB2 down")
@@ -220,6 +226,16 @@ class FakeSessionWorker:
         elif self.request.kind is WorkerKind.MACRO:
             self.harness.backend.mouse_down()
             self.progress(WorkerProgress.SHOT_BEGAN, "generated shot began")
+            weapon = (
+                self.harness.config.primary
+                if self.request.mode is WeaponMode.PRIMARY
+                else self.harness.config.secondary
+            )
+            if weapon.fire_mode == "automatic_hold":
+                self.progress(
+                    WorkerProgress.FINAL_SHOT_DOWN,
+                    "automatic fire hold began",
+                )
         elif self.request.kind is WorkerKind.SHIFT_TRANSACTION:
             if self.harness.auto_complete_shift:
                 self.finish_shift_transaction()
@@ -269,17 +285,21 @@ class FakeSessionWorker:
             else secondary_cycle_steps(self.harness.config)
         )
         shot_count = 1
-        total_shots = (
-            self.harness.config.primary.shots_per_cycle
+        weapon = (
+            self.harness.config.primary
             if self.request.mode is WeaponMode.PRIMARY
-            else self.harness.config.secondary.shots_per_cycle
+            else self.harness.config.secondary
         )
-        # activate() already scheduled the cycle's first MB1-down.
+        total_shots = (
+            1 if weapon.fire_mode == "automatic_hold" else weapon.shots_per_cycle
+        )
+        assert total_shots is not None
+        # activate() already scheduled the cycle's first logical fire-down.
         for step in steps[1:]:
             if step.action is OutputAction.WAIT:
                 self.harness.clock.advance_ms(step.duration_ms)
-            elif step.action is OutputAction.MB1_DOWN:
-                self.harness.backend.mouse_down()
+            elif step.action is OutputAction.FIRE_DOWN:
+                self.harness.backend.fire_down()
                 shot_count += 1
                 self.progress(WorkerProgress.SHOT_BEGAN, "generated shot began")
                 if shot_count == total_shots:
@@ -287,8 +307,8 @@ class FakeSessionWorker:
                         WorkerProgress.FINAL_SHOT_DOWN,
                         "final configured shot pressed",
                     )
-            elif step.action is OutputAction.MB1_UP:
-                self.harness.backend.mouse_up()
+            elif step.action is OutputAction.FIRE_UP:
+                self.harness.backend.fire_up()
                 if shot_count == total_shots:
                     self.progress(
                         WorkerProgress.FINAL_SHOT_UP,
@@ -1064,7 +1084,7 @@ def _scenario_o(config: AppConfig) -> str:
     assert h.audio.events == ["ON"]
     assert h.backend.events == [("MB1_DOWN", "RUNNING_PRIMARY")]
     events = [report.split("event=", 1)[1].split(" ", 1)[0] for report in h.reports if report.startswith("TRACE:")]
-    assert events[-2:] == ["MACRO_ENABLED", "FIRING_STARTED"]
+    assert events[-3:] == ["MACRO_ENABLED", "FIRING_STARTED", "FINAL_SHOT_DOWN"]
     assert not any(name.startswith("R_") for name, _state in h.backend.events)
     assert ControlEventKind.PHYSICAL_MB1_UP not in h.hook_events
     return "UNKNOWN PRIMARY scheduled its first shot at elapsed 0 ms"
@@ -1198,7 +1218,9 @@ def _scenario_t(config: AppConfig) -> str:
         (name, at - started_at) for name, at in h.backend.timed_events
     ]
     names = [name for name, _at in cycle_events]
-    assert names == ["MB1_DOWN", "MB1_UP"] * 45 + ["R_DOWN", "R_UP"]
+    hold = config.primary.automatic_hold_ms
+    assert hold is not None
+    assert names == ["MB1_DOWN", "MB1_UP", "R_DOWN", "R_UP"]
     assert all(
         source is EventSource.INJECTED_OWNED
         for _name, source in h.backend.tagged_events
@@ -1207,16 +1229,12 @@ def _scenario_t(config: AppConfig) -> str:
     assert h.hook_events.count(ControlEventKind.PHYSICAL_MB1_UP) == 1
     downs = [at for name, at in cycle_events if name == "MB1_DOWN"]
     ups = [at for name, at in cycle_events if name == "MB1_UP"]
-    assert len(downs) == len(ups) == 45
-    assert [up - down for down, up in zip(downs, ups)] == [35] * 45
-    period = config.primary.shot_period_ms
-    release = period - config.primary.fire_press_ms
-    final_down = (config.primary.shots_per_cycle - 1) * period
-    final_up = final_down + config.primary.fire_press_ms
+    assert len(downs) == len(ups) == 1
+    assert ups[0] - downs[0] == hold
+    final_down = 0
+    final_up = hold + config.primary.post_fire_reload_delay_ms
     reload_up = final_up + config.primary.reload_press_ms
     duration = reload_up + config.primary.reload_wait_ms
-    assert [later - earlier for earlier, later in zip(downs, downs[1:])] == [period] * 44
-    assert [next_down - up for up, next_down in zip(ups, downs[1:])] == [release] * 44
     assert cycle_events[-2:] == [("R_DOWN", final_up), ("R_UP", reload_up)]
     assert cycle_events[-2][1] - ups[-1] == 0
     assert round(h.clock() * 1000) - started_at == duration
@@ -1228,7 +1246,7 @@ def _scenario_t(config: AppConfig) -> str:
     assert h.backend.timed_events[-1] == ("MB1_DOWN", started_at + duration)
     assert h.machine.magazine_state(WeaponMode.PRIMARY) is MagazineState.UNKNOWN
     assert h.audio.events == ["ON"]
-    return "PRIMARY completed 45 tactical clicks, reloaded FULL, and repeated"
+    return "PRIMARY completed one automatic hold, reloaded FULL, and repeated"
 
 
 def _run_primary_cancellation(
@@ -1263,32 +1281,30 @@ def _run_primary_cancellation(
 
 
 def _scenario_u(config: AppConfig) -> str:
-    period = config.primary.shot_period_ms
-    press = config.primary.fire_press_ms
-    final_down = (config.primary.shots_per_cycle - 1) * period
-    reload_down = final_down + press
+    hold = config.primary.automatic_hold_ms
+    assert hold is not None
+    reload_down = hold + config.primary.post_fire_reload_delay_ms
     reload_up = reload_down + config.primary.reload_press_ms
     cases = (
-        ("shot 1 down", 5, 1, False),
-        ("shot 20 up interval", 19 * period + press + 5, 20, False),
-        ("after shot 44", 43 * period + press + 5, 44, False),
-        ("final shot down", final_down + 5, 45, False),
-        ("R-down", reload_down + 5, 45, True),
-        ("reload wait", reload_up + 5, 45, True),
+        ("early automatic hold", 5, False),
+        ("mid automatic hold", hold // 2, False),
+        ("late automatic hold", hold - 5, False),
+        ("R-down", reload_down + 5, True),
+        ("reload wait", reload_up + 5, True),
     )
-    for label, cancel_at, expected_shots, expect_reload in cases:
+    for label, cancel_at, expect_reload in cases:
         backend, result, progress = _run_primary_cancellation(config, cancel_at)
         names = [name for name, _state in backend.events]
         assert result.canceled, label
-        assert names.count("MB1_DOWN") == expected_shots, label
-        assert names.count("MB1_UP") == expected_shots, label
+        assert names.count("MB1_DOWN") == 1, label
+        assert names.count("MB1_UP") == 1, label
         assert ("R_DOWN" in names) is expect_reload, label
         assert ("R_UP" in names) is expect_reload, label
         assert WorkerProgress.RELOAD_COMPLETED not in (
             update.phase for update in progress
         ), label
         assert not backend.mouse_owned and not backend.reload_owned, label
-    return "PRIMARY cancellation cleaned input at six firing/reload positions"
+    return "PRIMARY cancellation cleaned its hold at firing/reload positions"
 
 
 def _scenario_v(config: AppConfig) -> str:
@@ -1333,7 +1349,7 @@ def _scenario_v(config: AppConfig) -> str:
     assert times[-2:] == [("R_DOWN", final_up), ("R_UP", reload_up)]
     assert times[-2][1] == ups[-1]
     assert progress[-1] == (WorkerProgress.RELOAD_COMPLETE, duration)
-    return "SECONDARY final MB1-up and R-down were consecutive at 1,475 ms"
+    return "SECONDARY final fire-up and R-down were consecutive at 1,475 ms"
 
 
 def _scenario_w(config: AppConfig) -> str:
@@ -1348,12 +1364,11 @@ def _scenario_w(config: AppConfig) -> str:
     relative = [(name, at - started_at) for name, at in h.backend.timed_events]
     downs = [at for name, at in relative if name == "MB1_DOWN"]
     ups = [at for name, at in relative if name == "MB1_UP"]
-    assert len(downs) == len(ups) == 45
-    final_down = (
-        (config.primary.shots_per_cycle - 1)
-        * config.primary.shot_period_ms
-    )
-    final_up = final_down + config.primary.fire_press_ms
+    assert len(downs) == len(ups) == 1
+    hold = config.primary.automatic_hold_ms
+    assert hold is not None
+    final_down = 0
+    final_up = hold + config.primary.post_fire_reload_delay_ms
     reload_up = final_up + config.primary.reload_press_ms
     duration = reload_up + config.primary.reload_wait_ms
     assert downs[-1] == final_down and ups[-1] == final_up
@@ -1950,7 +1965,7 @@ def _scenario_at(config: AppConfig) -> str:
         if report.startswith("TRACE:")
     ]
     assert "AIM_PHYSICAL_ON" in events
-    assert events[-2:] == ["MACRO_ENABLED", "FIRING_STARTED"]
+    assert events[-3:] == ["MACRO_ENABLED", "FIRING_STARTED", "FINAL_SHOT_DOWN"]
     assert not any("event=AIM_REQUIRED_REJECTED" in item for item in h.reports)
     return "PowerShell baseline then target RMB/MB1 reached FIRING_STARTED"
 

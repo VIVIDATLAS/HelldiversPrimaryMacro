@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import nullcontext
 from typing import Callable, Protocol
 
+from .cadence_diagnostics import CadenceDiagnostics
 from .config import AppConfig
 from .input_backend import InputApiError, InputCoordination
 from .models import (
@@ -26,6 +28,8 @@ class ForegroundLost(RuntimeError):
 
 
 class GeneratedInput(Protocol):
+    def fire_down(self) -> None: ...
+    def fire_up(self) -> None: ...
     def mouse_down(self) -> None: ...
     def mouse_up(self) -> None: ...
     def aim_down(self) -> None: ...
@@ -39,15 +43,42 @@ class GeneratedInput(Protocol):
 
 
 def primary_cycle_steps(config: AppConfig) -> list[CycleStep]:
-    steps: list[CycleStep] = []
     primary = config.primary
+    if primary.fire_mode == "automatic_hold":
+        assert primary.automatic_hold_ms is not None
+        steps = [
+            CycleStep(OutputAction.FIRE_DOWN),
+            CycleStep(OutputAction.WAIT, primary.automatic_hold_ms),
+            CycleStep(OutputAction.FIRE_UP),
+        ]
+        if primary.post_fire_reload_delay_ms:
+            steps.append(
+                CycleStep(
+                    OutputAction.WAIT,
+                    primary.post_fire_reload_delay_ms,
+                )
+            )
+        steps.extend(
+            [
+                CycleStep(OutputAction.R_DOWN),
+                CycleStep(OutputAction.WAIT, primary.reload_press_ms),
+                CycleStep(OutputAction.R_UP),
+                CycleStep(OutputAction.WAIT, primary.reload_wait_ms),
+            ]
+        )
+        return steps
+
+    assert primary.shots_per_cycle is not None
+    assert primary.shot_period_ms is not None
+    assert primary.fire_press_ms is not None
+    steps: list[CycleStep] = []
     between_ms = primary.shot_period_ms - primary.fire_press_ms
     for shot in range(primary.shots_per_cycle):
         steps.extend(
             [
-                CycleStep(OutputAction.MB1_DOWN),
+                CycleStep(OutputAction.FIRE_DOWN),
                 CycleStep(OutputAction.WAIT, primary.fire_press_ms),
-                CycleStep(OutputAction.MB1_UP),
+                CycleStep(OutputAction.FIRE_UP),
             ]
         )
         if shot < primary.shots_per_cycle - 1:
@@ -66,17 +97,37 @@ def primary_cycle_steps(config: AppConfig) -> list[CycleStep]:
 def secondary_cycle_steps(config: AppConfig) -> list[CycleStep]:
     steps: list[CycleStep] = []
     secondary = config.secondary
-    between_ms = secondary.shot_period_ms - secondary.fire_press_ms
-    for shot in range(secondary.shots_per_cycle):
+    if secondary.fire_mode == "automatic_hold":
+        assert secondary.automatic_hold_ms is not None
         steps.extend(
             [
-                CycleStep(OutputAction.MB1_DOWN),
-                CycleStep(OutputAction.WAIT, secondary.fire_press_ms),
-                CycleStep(OutputAction.MB1_UP),
+                CycleStep(OutputAction.FIRE_DOWN),
+                CycleStep(OutputAction.WAIT, secondary.automatic_hold_ms),
+                CycleStep(OutputAction.FIRE_UP),
             ]
         )
-        if shot < secondary.shots_per_cycle - 1:
-            steps.append(CycleStep(OutputAction.WAIT, between_ms))
+        if secondary.post_fire_reload_delay_ms:
+            steps.append(
+                CycleStep(
+                    OutputAction.WAIT,
+                    secondary.post_fire_reload_delay_ms,
+                )
+            )
+    else:
+        assert secondary.shots_per_cycle is not None
+        assert secondary.shot_period_ms is not None
+        assert secondary.fire_press_ms is not None
+        between_ms = secondary.shot_period_ms - secondary.fire_press_ms
+        for shot in range(secondary.shots_per_cycle):
+            steps.extend(
+                [
+                    CycleStep(OutputAction.FIRE_DOWN),
+                    CycleStep(OutputAction.WAIT, secondary.fire_press_ms),
+                    CycleStep(OutputAction.FIRE_UP),
+                ]
+            )
+            if shot < secondary.shots_per_cycle - 1:
+                steps.append(CycleStep(OutputAction.WAIT, between_ms))
     steps.extend(
         [
             CycleStep(OutputAction.R_DOWN),
@@ -98,6 +149,7 @@ class MacroEngine:
         clock: Callable[[], float] = time.perf_counter,
         wait: Callable[[threading.Event, float], bool] | None = None,
         io_lock: threading.RLock | None = None,
+        cadence_diagnostics: CadenceDiagnostics | None = None,
     ) -> None:
         self._config = config
         self.backend = backend
@@ -105,7 +157,20 @@ class MacroEngine:
         self._clock = clock
         self._wait = wait or (lambda event, seconds: event.wait(seconds))
         self.io_lock = io_lock or threading.RLock()
+        self._cadence_diagnostics = cadence_diagnostics
         self._poll_seconds = config.controls.poll_ms / 1000.0
+        self._fire_action_names = (
+            ("P_DOWN", "P_UP")
+            if config.output.fire_device == "keyboard"
+            else ("MB1_DOWN", "MB1_UP")
+        )
+
+    def _diagnostic_action(self, action: OutputAction) -> str:
+        if action is OutputAction.FIRE_DOWN:
+            return self._fire_action_names[0]
+        if action is OutputAction.FIRE_UP:
+            return self._fire_action_names[1]
+        return action.value
 
     def _check_active(
         self, cancel_event: threading.Event, shutdown_event: threading.Event
@@ -139,17 +204,33 @@ class MacroEngine:
         with self.io_lock:
             self._check_active(cancel_event, shutdown_event)
             for action in actions:
-                if action is OutputAction.MB1_DOWN:
-                    self.backend.mouse_down()
-                elif action is OutputAction.MB1_UP:
-                    self.backend.mouse_up()
-                elif action is OutputAction.R_DOWN:
-                    self.backend.reload_down()
-                    reload_started()
-                elif action is OutputAction.R_UP:
-                    self.backend.reload_up()
-                else:
-                    raise AssertionError(f"unexpected output action: {action}")
+                if self._cadence_diagnostics is None:
+                    if action is OutputAction.FIRE_DOWN:
+                        self.backend.fire_down()
+                    elif action is OutputAction.FIRE_UP:
+                        self.backend.fire_up()
+                    elif action is OutputAction.R_DOWN:
+                        self.backend.reload_down()
+                        reload_started()
+                    elif action is OutputAction.R_UP:
+                        self.backend.reload_up()
+                    else:
+                        raise AssertionError(f"unexpected output action: {action}")
+                    continue
+                with self._cadence_diagnostics.macro_action(
+                    self._diagnostic_action(action)
+                ):
+                    if action is OutputAction.FIRE_DOWN:
+                        self.backend.fire_down()
+                    elif action is OutputAction.FIRE_UP:
+                        self.backend.fire_up()
+                    elif action is OutputAction.R_DOWN:
+                        self.backend.reload_down()
+                        reload_started()
+                    elif action is OutputAction.R_UP:
+                        self.backend.reload_up()
+                    else:
+                        raise AssertionError(f"unexpected output action: {action}")
 
     def _perform_output(
         self,
@@ -200,12 +281,18 @@ class MacroEngine:
             if mode is WeaponMode.PRIMARY
             else secondary_cycle_steps(self._config)
         )
-        total_shots = (
-            self._config.primary.shots_per_cycle
+        weapon = (
+            self._config.primary
             if mode is WeaponMode.PRIMARY
-            else self._config.secondary.shots_per_cycle
+            else self._config.secondary
         )
+        total_shots = (
+            1 if weapon.fire_mode == "automatic_hold" else weapon.shots_per_cycle
+        )
+        assert total_shots is not None
         shot_count = 0
+        if self._cadence_diagnostics is not None:
+            self._cadence_diagnostics.macro_worker_started(mode.value)
 
         def report(phase: WorkerProgress, reason: str) -> None:
             progress(WorkerProgressUpdate(phase, self._clock(), reason))
@@ -242,10 +329,10 @@ class MacroEngine:
                         actions.append(steps[index].action)
                         index += 1
                     # Consecutive output actions share one short I/O boundary.
-                    # Each profile's final MB1-up and R-down therefore have no wait,
+                    # Each profile's final fire-up and R-down therefore have no wait,
                     # controller queue operation, or lock release between them.
                     if (
-                        OutputAction.MB1_DOWN in actions
+                        OutputAction.FIRE_DOWN in actions
                         and not firing_snapshot_published
                     ):
                         firing_started()
@@ -260,7 +347,7 @@ class MacroEngine:
                         firing_stopped()
                         firing_snapshot_published = False
                     for action in actions:
-                        if action is OutputAction.MB1_DOWN:
+                        if action is OutputAction.FIRE_DOWN:
                             shot_count += 1
                             report(
                                 WorkerProgress.SHOT_BEGAN,
@@ -271,7 +358,7 @@ class MacroEngine:
                                     WorkerProgress.FINAL_SHOT_DOWN,
                                     "final configured shot pressed",
                                 )
-                        elif action is OutputAction.MB1_UP and shot_count == total_shots:
+                        elif action is OutputAction.FIRE_UP and shot_count == total_shots:
                             report(
                                 WorkerProgress.FINAL_SHOT_UP,
                                 "final configured shot released",
@@ -304,12 +391,15 @@ class MacroEngine:
             if reload_phase_started and not reload_completed:
                 report(WorkerProgress.RELOAD_FAILED, str(exc))
         firing_stopped()
-        return self._finish_result(
+        result = self._finish_result(
             success=success,
             canceled=canceled,
             error=error,
             release_owned=self.backend.release_all,
         )
+        if self._cadence_diagnostics is not None:
+            self._cadence_diagnostics.macro_worker_stopped()
+        return result
 
     def prepare_reload(
         self,
@@ -510,13 +600,13 @@ class MacroEngine:
         canceled = False
         success = False
         try:
-            # This release is deliberately ordered before the bypass down, even
+            # This release is deliberately ordered before the physical-click
+            # bypass down, even
             # if a prior macro cleanup reported completion with stale ownership.
             with self.io_lock:
                 self.backend.release_all()
-            self._perform_output(
-                OutputAction.MB1_DOWN, cancel_event, shutdown_event
-            )
+                self._check_active(cancel_event, shutdown_event)
+                self.backend.mouse_down()
             down_at = self._clock()
             while not physical_release.is_set():
                 self._check_active(cancel_event, shutdown_event)
@@ -527,7 +617,9 @@ class MacroEngine:
                 self._cancelable_wait(
                     int(remaining_ms + 0.999), cancel_event, shutdown_event
                 )
-            self._perform_output(OutputAction.MB1_UP, cancel_event, shutdown_event)
+            with self.io_lock:
+                self._check_active(cancel_event, shutdown_event)
+                self.backend.mouse_up()
             success = True
         except InterruptedError:
             canceled = True
@@ -602,7 +694,16 @@ class MacroWorker:
                 elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
                     self._engine.backend.release_shift_inputs()
                 else:
-                    self._engine.backend.release_all()
+                    context = (
+                        self._engine._cadence_diagnostics.macro_cleanup_scope(
+                            "controller cancel_and_release"
+                        )
+                        if self._engine._cadence_diagnostics is not None
+                        and self.request.kind is WorkerKind.MACRO
+                        else nullcontext()
+                    )
+                    with context:
+                        self._engine.backend.release_all()
         except BaseException as exc:
             return exc
         return None
@@ -617,7 +718,15 @@ class MacroWorker:
                 self._finish_after_reload.set()
                 return True
             self.cancel()
-            self._engine.backend.release_all()
+            context = (
+                self._engine._cadence_diagnostics.macro_cleanup_scope(
+                    "controller sprint stop"
+                )
+                if self._engine._cadence_diagnostics is not None
+                else nullcontext()
+            )
+            with context:
+                self._engine.backend.release_all()
             return False
 
     def cancel_shift_and_observe(

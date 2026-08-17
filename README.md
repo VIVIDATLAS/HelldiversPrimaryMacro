@@ -6,9 +6,10 @@ not use administrator privileges, game memory, screen recognition, DLL
 injection, network inspection, hardware emulation, concealed automation, or an
 anti-cheat bypass. Verify the game's current rules before use.
 
-Ordinary `SendInput` can be rejected by the game, UIPI/integrity-level rules,
-or anti-cheat software. A rejection stops work and releases owned inputs; this
-project does not provide a bypass or elevated-mode workaround.
+Ordinary `SendInput` can fail at the Windows API boundary or be accepted into
+the Windows input stream but ignored by the game. An API failure stops work and
+releases owned inputs; this project does not provide a UIPI, integrity-level,
+anti-cheat, or elevated-mode bypass.
 
 ## Setup and safe inspection
 
@@ -26,39 +27,43 @@ project does not provide a bypass or elevated-mode workaround.
 
 Running `python main.py` without a mode prints help and does nothing.
 
-## Primary semi-automatic profile and calibration
+## Primary automatic-hold profile and calibration
 
-PRIMARY is a configurable 45-shot semi-automatic rifle profile. The weapon is
-capable of automatic fire, so configure it to semi-automatic manually in
-Helldivers before using this profile. The macro does not inspect or change the
-weapon's firing mode; it emits 45 independent MB1 click pairs.
+Configure the AR-2 to **Automatic** in Helldivers and keep Fire bound to MB1.
+Physical MB1 remains the macro ON/OFF toggle. Once an aimed activation is
+accepted, the generated ownership-tagged MB1 is held continuously; Helldivers,
+not Python, controls the weapon's automatic cadence. No additional P binding is
+required.
 
-The initial primary configuration is:
+```toml
+[output]
+fire_device = "mouse"
+```
+
+`fire_device` accepts exactly `"keyboard"` or `"mouse"`. Mouse mode needs no
+scan code. The tested keyboard scan-code backend remains available as an
+inactive optional mode, but it is not part of normal setup.
+
+The retained live-tested AR-2 reference in `profiles/ar2-coyote.toml` is:
 
 ```toml
 [primary]
-shots_per_cycle = 45
-shot_period_ms = 85
-fire_press_ms = 35
+fire_mode = "automatic_hold"
+automatic_hold_ms = 4450
+post_fire_reload_delay_ms = 0
 reload_press_ms = 25
 reload_wait_ms = 2000
 ```
 
-`shot_period_ms` is authoritative. The MB1-up interval is derived as
-`shot_period_ms - fire_press_ms`, so the configured values produce 35 ms down
-and a 50 ms release interval between consecutive shots. Timing remains entirely
-configuration-driven; this correction does not change PRIMARY behavior.
+At 600 RPM, shots are nominally 100 ms apart: the 45th is expected near 4,400
+ms and the 46th near 4,500 ms. The initial 4,450 ms hold aims to release after
+45 rounds but before the chambered 46th. Calibrate only
+`primary.automatic_hold_ms`; the application cannot observe muzzle events or
+ammunition, so this remains a manual live measurement.
 
-For later calibration, change only `primary.shot_period_ms` in `config.toml`,
-then run configuration validation and the primary dry run. Do not change the
-shot count, click-down time, or reload timing during firing-rate calibration.
-The configured period is an observed operational value, not an inferred weapon
-limit. Do not change it during unrelated control or reload work.
-
-The tactical-reload cycle assumes a maximum loaded state of 46: start at 46,
-fire exactly 45 shots, leave one round chambered, reload, and return to 46. Do
-not configure 46 shots per cycle because firing the chambered round would empty
-the weapon and the next reload could return only 45.
+The tactical-reload strategy assumes a maximum loaded state of 46: start at 46,
+allow automatic fire to consume 45, leave one chambered, reload, and return to
+46. Python cannot count accepted automatic shots.
 
 The user should manually establish 46 rounds before starting the synchronized
 cycle. If activation begins with only 45 rounds, the first cycle may empty the
@@ -113,7 +118,7 @@ is ready. Selection never starts firing automatically.
 An unmodified physical MB1 pair beginning while Helldivers is freshly confirmed
 foreground is suppressed. Its physical down edge can enable the selected macro
 only while the inferred aim state is exactly `AIM_ON`. `AIM_OFF` and `UNKNOWN`
-are rejected with `AIM_REQUIRED`: no worker, generated MB1, ON/OFF audio, or
+are rejected with `AIM_REQUIRED`: no worker, generated fire input, ON/OFF audio, or
 reload is created. MB1-up is cleanup-only: it clears physical/pair state and
 never starts, rejects, toggles, prepares, changes weapons, or emits audio. On
 an aimed accepted down edge the controller sets `enabled`, queues ON, invalidates
@@ -156,20 +161,20 @@ pass through and cannot control the macro.
 ## Ctrl+MB1 normal and deferred behavior
 
 The keyboard hook records physical Left/Right Ctrl synchronously before it
-queues the higher-level cancellation event. If Ctrl is held, generated MB1 is
-not owned, and cleanup is complete, the complete physical MB1 pair passes
+queues the higher-level cancellation event. If Ctrl is held, generated fire
+input is not owned, and cleanup is complete, the complete physical MB1 pair passes
 through normally and never toggles the macro.
 
 Ctrl+MB1 is the explicit normal-click bypass for menus and manual interaction.
 The aim-required firing gate applies only to unmodified MB1 macro activation;
 the bypass never enables a worker or plays ON/OFF audio.
 
-If a rapid Ctrl+MB1 begins while generated MB1 is still down or cancellation
+If a rapid Ctrl+MB1 begins while generated fire input is still down or cancellation
 cleanup is pending, the complete physical pair is suppressed and deferred.
 Work is performed outside the hook thread in this strict order:
 
 ```text
-generated MB1-up
+generated automatic MB1-up
 bypass MB1-down
 bypass MB1-up
 ```
@@ -203,7 +208,7 @@ transaction. The generated order is:
 
 ```text
 MACRO_DISABLED
-owned MB1-up, if the shot was down
+owned generated MB1-up, if automatic fire was held
 FIRING_STOPPED / OFF once
 owned MB2-down
 owned MB2-up
@@ -226,7 +231,7 @@ Shift events are ignored by the hook and cannot recurse.
 The deferred transaction is ordered as follows:
 
 ```text
-disable active firing and release owned MB1, if needed
+disable active firing and release owned generated MB1, if needed
 conditional owned MB2-down/up when assumed aim is ON
 owned replay of the same physical Shift scan-code down/up
 ```
@@ -362,18 +367,16 @@ or bypass anti-cheat restrictions.
 
 ## Exact firing cycles
 
-PRIMARY repeats exactly 45 discrete clicks at the configured 85 ms period.
-Shots 1 through 44 are MB1 down 35 ms, up, then wait 50 ms. Shot 45 is MB1 down
-at 3740 ms and up at 3775 ms; scan-code `R` goes down immediately at the same
-3775 ms timestamp under one short output-serialization boundary. There is no
-post-shot wait, controller round trip, worker handoff, or sleeping lock between
-the final MB1-up and R-down. `R` goes up at 3800 ms, the 2000 ms reload wait
-then runs, and valid completion occurs at 5800 ms. ON is not replayed between
-cycles.
+PRIMARY emits one tagged MB1-down at 0 ms, holds it for 4,450 ms, then emits
+MB1-up and `R`-down consecutively under one short output boundary. `R` goes up
+at 4,475 ms, the 2,000 ms reload wait follows, and the cycle completes at
+6,475 ms. ON is not replayed between cycles. A manual stop during the hold
+releases MB1 promptly and emits no `R`.
 
-SECONDARY repeats exactly 13 shots at the configured 120 ms period. Shots 1
-through 12 are MB1 down 35 ms, up, then wait 85 ms. Shot 13 is down at 1440 ms
-and up at 1475 ms; `R` goes down immediately at the same 1475 ms timestamp
+SECONDARY remains tap mode and repeats exactly 13 tagged MB1 presses at the
+configured 120 ms period. Shots 1 through 12 are MB1 down 35 ms, up, then wait
+85 ms. Shot 13 is down at 1,440 ms and up at 1,475 ms; `R` goes down
+immediately at the same 1,475 ms timestamp
 under the same short output boundary. `R` goes up at 1500 ms, the 2000 ms reload
 wait follows, and the complete cycle is 3500 ms. No timing configuration value
 was reduced to obtain the zero-gap reload.
@@ -389,6 +392,65 @@ signals preparation cancellation without acquiring that lock or joining the
 thread. A retired preparation may release only its owned `R`; it cannot release
 the current macro's MB1. State and generated-input ownership are published
 before the firing worker is activated.
+
+Live mode requests a 1 ms Windows multimedia timer resolution for its complete
+lifecycle. The relative firing sequence and 5 ms interruptible cancellation
+polls are unchanged; the resolution request allows those short waits to use a
+finer Windows timer quantum instead of repeatedly inheriting the default. The request is
+reference-counted and matched by `timeEndPeriod` after normal shutdown,
+Ctrl+C, startup/hook failure, or an exception. If acquisition fails, live mode
+prints one warning and continues with the documented default-resolution
+fallback. Configuration checks, dry runs, simulation, and tests never activate
+the live timer lease. No absolute shot deadlines, rebasing, catch-up output,
+busy spinning, or priority changes are used.
+
+## Opt-in cadence diagnostics
+
+Dry-run counts cannot prove that Windows delivered each owned event through the
+hook or that Helldivers accepted it. For one deliberate manual live test, use:
+
+```powershell
+python main.py --live --cadence-diagnostics
+```
+
+The flag is valid only with `--live` and is disabled by default. It arms on the
+first generated PRIMARY MB1-down, captures one MB1 hold pair and the immediately
+following `R` pair, then freezes.
+Later cycles are counted as ignored diagnostic events but continue normally.
+If that first phase is canceled, the capture freezes incomplete instead of
+merging a later activation into it. Physical input, generated aim/sprint input,
+and unrelated keyboard input are never recorded. During the bounded capture,
+only configured MB1/R injected metadata is retained. Cursor coordinates and physical
+mouse input are never retained.
+Both the SendInput and hook structures use one canonical unsigned
+pointer-width `ULONG_PTR`; the hook dereference and comparison preserve and
+normalize all pointer-width bits. The canonical marker is the live-observed-safe
+32-bit value `0x43524f31`, stored in pointer-width fields for every generated
+device.
+Recording performs no console/file output, wait, backend call, or output-lock
+acquisition from the hook. After Ctrl+C and safe shutdown, one summary reports:
+
+- `captured_primary_cycles`, `capture_complete`, and
+  `extra_events_ignored_after_capture`;
+- intended MB1/R counts for the active automatic mouse-hold cycle;
+- every bounded backend call's requested/accepted count, before/after time,
+  call duration, failures, and recent last-error values;
+- the backend-dispatch MB1 hold duration independent of hook observation;
+- owned hook-observed, passed, suppressed, and controller-routed counts;
+- injected keyboard and mouse callback marker match/mismatch counts;
+- the backend marker alongside bounded hook-observed `dwExtraInfo` values;
+- cleanup releases, final fire-up/R-down times and their gap;
+- per-device/action pending expected and unmatched observed counts, plus
+  bounded injected-mouse and anomaly records.
+
+For a useful capture, manually establish 46 rounds, set the AR-2 to Automatic,
+aim, and start one complete PRIMARY cycle. The recorder freezes
+after its `R` pair, so Ctrl+C can be pressed later without contaminating the
+capture with subsequent cycles. Preserve the full `CADENCE DIAGNOSTICS SUMMARY` and report it
+along with the observed ammunition immediately before reload. An accepted
+`SendInput` count proves Windows accepted the event array, not that the game
+consumed the shot; matching hook counts and timing isolate that remaining
+game-side boundary.
 
 ## Audio
 
@@ -414,6 +476,7 @@ python main.py --dry-run-secondary-cycle
 python main.py --simulate-session
 python main.py --test-audio
 python main.py --live
+python main.py --live --cadence-diagnostics
 ```
 
 Only `--live` installs hooks, suppresses paired physical MB1/foreground Shift
