@@ -39,7 +39,7 @@ class WorkerKind(Enum):
     MACRO = auto()
     PREPARATION = auto()
     RELOAD_ONLY = auto()
-    AIM_OFF = auto()
+    SHIFT_TRANSACTION = auto()
     BYPASS = auto()
 
 
@@ -52,6 +52,9 @@ class WorkerProgress(Enum):
     RELOAD_WAIT_STARTED = auto()
     RELOAD_COMPLETED = auto()
     RELOAD_FAILED = auto()
+    AIM_OFF_SENT = auto()
+    SHIFT_REPLAY_DOWN = auto()
+    SHIFT_REPLAY_UP = auto()
     # Compatibility alias for existing callers while trace output uses the
     # approved RELOAD_COMPLETED diagnostic name.
     RELOAD_COMPLETE = RELOAD_COMPLETED
@@ -119,6 +122,12 @@ class ControlEvent:
 
 
 @dataclass(frozen=True)
+class ShiftStroke:
+    vk_code: int
+    scan_code: int
+
+
+@dataclass(frozen=True)
 class WorkerRequest:
     kind: WorkerKind
     mode: WeaponMode
@@ -127,6 +136,10 @@ class WorkerRequest:
     bypass_click_ms: int = 0
     preparation_generation: int = 0
     generation: int = 0
+    shift_vk_code: int = 0
+    shift_scan_code: int = 0
+    cancel_aim: bool = False
+    native_aim_cancel: bool = False
 
 
 @dataclass(frozen=True)

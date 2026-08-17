@@ -347,7 +347,7 @@ class StateMachineTests(unittest.TestCase):
         h.drain()
         self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
 
-    def test_right_button_does_not_cancel_macro_or_sprint_reload(self) -> None:
+    def test_right_button_does_not_cancel_macro_reload_or_generate_shift(self) -> None:
         macro_reload = SimulationHarness(CONFIG, trace=False)
         macro_reload.start(WeaponMode.PRIMARY)
         macro = macro_reload.machine.worker
@@ -373,32 +373,9 @@ class StateMachineTests(unittest.TestCase):
             ),
         )
         self.assertIs(macro_reload.machine.aim_state, AimState.AIM_ON)
+        self.assertNotIn("SHIFT_DOWN", [name for name, _ in macro_reload.backend.events])
 
-        sprint = SimulationHarness(CONFIG, trace=False)
-        sprint.start(WeaponMode.PRIMARY)
-        sprint.auto_complete_preparation = False
-        sprint.key_press(VK_LSHIFT)
-        before = (
-            sprint.machine.state,
-            sprint.machine.generation,
-            sprint.machine.worker,
-            tuple(sprint.audio.events),
-        )
-        self.assertFalse(sprint.policy.mouse(WM_RBUTTONDOWN, 0, 0))
-        self.assertFalse(sprint.policy.mouse(WM_RBUTTONUP, 0, 0))
-        sprint.drain()
-        self.assertEqual(
-            before,
-            (
-                sprint.machine.state,
-                sprint.machine.generation,
-                sprint.machine.worker,
-                tuple(sprint.audio.events),
-            ),
-        )
-        self.assertIs(sprint.machine.aim_state, AimState.AIM_ON)
-
-    def test_shift_conditionally_sends_one_aim_off_pair(self) -> None:
+    def test_shift_conditionally_orders_aim_off_before_replay(self) -> None:
         h = SimulationHarness(CONFIG, trace=True)
         self.assertFalse(h.policy.mouse(WM_RBUTTONDOWN, 0, 0))
         self.assertFalse(h.policy.mouse(WM_RBUTTONUP, 0, 0))
@@ -407,18 +384,20 @@ class StateMachineTests(unittest.TestCase):
         macro_generation = h.machine.generation
         before = len(h.backend.events)
 
-        h.key_press(VK_LSHIFT, repeats=3)
+        results = h.key_press(VK_LSHIFT, repeats=3)
 
+        self.assertTrue(all(results))
         self.assertEqual(
             [name for name, _state in h.backend.events[before:]],
-            ["MB2_DOWN", "MB2_UP"],
+            ["MB2_DOWN", "MB2_UP", "SHIFT_DOWN", "SHIFT_UP"],
         )
         self.assertTrue(
             all(
                 source is EventSource.INJECTED_OWNED
-                for _name, source in h.backend.tagged_events[-2:]
+                for _name, source in h.backend.tagged_events[-4:]
             )
         )
+        self.assertEqual(h.backend.shift_scans, [0x2A])
         self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
         self.assertEqual(h.machine.generation, macro_generation)
         self.assertEqual(h.audio.events, [])
@@ -426,17 +405,29 @@ class StateMachineTests(unittest.TestCase):
             sum("event=AIM_OFF_REQUESTED" in item for item in h.reports), 1
         )
         self.assertEqual(sum("event=AIM_OFF_SENT" in item for item in h.reports), 1)
-
-        delivered = len(h.backend.events)
-        h.key_press(VK_RSHIFT, repeats=2)
-        self.assertEqual(len(h.backend.events), delivered)
-        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
+        for event_name in (
+            "SHIFT_DEFERRED",
+            "SHIFT_TRANSACTION_STARTED",
+            "SHIFT_REPLAY_DOWN",
+            "SHIFT_REPLAY_UP",
+            "SHIFT_TRANSACTION_COMPLETED",
+        ):
+            self.assertEqual(
+                sum(f"event={event_name}" in item for item in h.reports),
+                1,
+            )
+        names = [name for name, _state in h.backend.events]
+        self.assertLess(names.index("MB2_UP"), names.index("SHIFT_DOWN"))
+        self.assertNotIn("R_DOWN", names)
 
     def test_shift_while_aim_off_or_unknown_never_generates_mb2(self) -> None:
         off = SimulationHarness(CONFIG, trace=True)
         off.key_press(VK_LSHIFT, repeats=2)
         self.assertIs(off.machine.aim_state, AimState.AIM_OFF)
-        self.assertEqual(off.backend.events, [])
+        self.assertEqual(
+            [name for name, _state in off.backend.events],
+            ["SHIFT_DOWN", "SHIFT_UP"],
+        )
         self.assertEqual(off.audio.events, [])
 
         unknown = SimulationHarness(CONFIG, trace=True)
@@ -445,8 +436,17 @@ class StateMachineTests(unittest.TestCase):
         unknown.foreground.certain = True
         unknown.key_press(VK_RSHIFT, repeats=2)
         self.assertIs(unknown.machine.aim_state, AimState.UNKNOWN)
-        self.assertEqual(unknown.backend.events, [])
+        self.assertEqual(
+            [name for name, _state in unknown.backend.events],
+            ["SHIFT_DOWN", "SHIFT_UP"],
+        )
         self.assertEqual(unknown.audio.events, [])
+        self.assertFalse(
+            any(
+                name in ("MB2_DOWN", "MB2_UP", "R_DOWN")
+                for name, _state in off.backend.events + unknown.backend.events
+            )
+        )
 
     def test_physical_mb2_invalidates_obsolete_pending_aim_worker(self) -> None:
         h = SimulationHarness(
@@ -460,7 +460,9 @@ class StateMachineTests(unittest.TestCase):
         h.drain()
         h.key_press(VK_LSHIFT)
         worker = next(
-            item for item in h.workers if item.request.kind is WorkerKind.AIM_OFF
+            item
+            for item in h.workers
+            if item.request.kind is WorkerKind.SHIFT_TRANSACTION
         )
         self.assertIs(h.machine.aim_state, AimState.AIM_OFF_PENDING)
 
@@ -487,7 +489,9 @@ class StateMachineTests(unittest.TestCase):
         h.drain()
         h.key_press(VK_LSHIFT)
         worker = next(
-            item for item in h.workers if item.request.kind is WorkerKind.AIM_OFF
+            item
+            for item in h.workers
+            if item.request.kind is WorkerKind.SHIFT_TRANSACTION
         )
         worker.begin_aim_off()
         self.assertTrue(h.backend.aim_owned)
@@ -495,6 +499,7 @@ class StateMachineTests(unittest.TestCase):
         h.foreground_loss()
 
         self.assertFalse(h.backend.aim_owned)
+        self.assertFalse(h.backend.shift_owned)
         self.assertIs(h.machine.aim_state, AimState.UNKNOWN)
         self.assertTrue(worker.cancel_requested)
 
@@ -505,7 +510,9 @@ class StateMachineTests(unittest.TestCase):
         h.drain()
         h.key_press(VK_LSHIFT)
         worker = next(
-            item for item in h.workers if item.request.kind is WorkerKind.AIM_OFF
+            item
+            for item in h.workers
+            if item.request.kind is WorkerKind.SHIFT_TRANSACTION
         )
 
         worker.finish(WorkerResult(False, error=RuntimeError("fake MB2 failure")))
@@ -514,11 +521,14 @@ class StateMachineTests(unittest.TestCase):
         self.assertIs(h.machine.aim_state, AimState.UNKNOWN)
         self.assertEqual(h.backend.events, [])
         self.assertEqual(
-            sum("event=AIM_OFF_FAILED" in item for item in h.reports),
+            sum("event=SHIFT_TRANSACTION_FAILED" in item for item in h.reports),
             1,
         )
         self.assertEqual(
-            sum(item.request.kind is WorkerKind.AIM_OFF for item in h.workers),
+            sum(
+                item.request.kind is WorkerKind.SHIFT_TRANSACTION
+                for item in h.workers
+            ),
             1,
         )
 
@@ -539,32 +549,35 @@ class StateMachineTests(unittest.TestCase):
         h.key_press(VK_LSHIFT, repeats=3)
 
         self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
-        self.assertEqual(h.backend.events, [])
+        self.assertEqual(
+            [name for name, _state in h.backend.events],
+            ["SHIFT_DOWN", "SHIFT_UP"],
+        )
+        self.assertNotIn("MB2_DOWN", [name for name, _ in h.backend.events])
         self.assertEqual(h.audio.events, [])
 
-    def test_shift_aim_off_does_not_change_sprint_reload_contract(self) -> None:
-        h = SimulationHarness(CONFIG, trace=True)
-        h.start(WeaponMode.PRIMARY)
-        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
-        h.policy.mouse(WM_RBUTTONUP, 0, 0)
-        h.drain()
-        before = len(h.backend.events)
-
-        h.key_press(VK_LSHIFT, repeats=2)
-
-        emitted = [name for name, _state in h.backend.events[before:]]
+    def test_persistent_sprint_rmb_toggles_do_not_generate_shift(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False)
+        h.key_press(VK_LSHIFT)
+        shift_events = sum(
+            name == "SHIFT_DOWN" for name, _state in h.backend.events
+        )
+        for expected in (AimState.AIM_ON, AimState.AIM_OFF):
+            self.assertFalse(h.policy.mouse(WM_RBUTTONDOWN, 0, 0))
+            self.assertFalse(h.policy.mouse(WM_RBUTTONUP, 0, 0))
+            h.drain()
+            self.assertIs(h.machine.aim_state, expected)
         self.assertEqual(
-            emitted,
-            ["MB1_UP", "MB2_DOWN", "MB2_UP", "R_DOWN", "R_UP"],
+            sum(name == "SHIFT_DOWN" for name, _state in h.backend.events),
+            shift_events,
         )
-        self.assertEqual(h.audio.events, ["ON", "OFF"])
-        self.assertFalse(h.machine.enabled)
-        self.assertIs(h.machine.aim_state, AimState.AIM_OFF)
-        self.assertIs(
-            h.machine.magazine_state(WeaponMode.PRIMARY),
-            MagazineState.FULL,
+        self.assertNotIn("R_DOWN", [name for name, _state in h.backend.events])
+
+        h.key_press(VK_RSHIFT)
+        self.assertEqual(
+            sum(name == "SHIFT_DOWN" for name, _state in h.backend.events),
+            shift_events + 1,
         )
-        self.assertEqual(emitted.count("R_DOWN"), 1)
 
     def test_weapon_selection_does_not_toggle_assumed_aim(self) -> None:
         h = SimulationHarness(CONFIG, trace=False)
@@ -577,7 +590,7 @@ class StateMachineTests(unittest.TestCase):
 
         self.assertIs(h.machine.aim_state, AimState.AIM_ON)
 
-    def test_left_and_right_shift_stop_firing_once_then_reload_disabled(self) -> None:
+    def test_left_and_right_shift_stop_firing_once_without_reload(self) -> None:
         for mode, vk_code in (
             (WeaponMode.PRIMARY, VK_LSHIFT),
             (WeaponMode.SECONDARY, VK_RSHIFT),
@@ -586,23 +599,29 @@ class StateMachineTests(unittest.TestCase):
                 h = SimulationHarness(CONFIG, trace=True)
                 h.start(mode)
                 before = len(h.backend.events)
+                reloads_before = sum(
+                    name == "R_DOWN" for name, _state in h.backend.events
+                )
                 results = h.key_press(vk_code, repeats=3)
-                self.assertTrue(all(result is False for result in results))
+                self.assertTrue(all(results))
                 self.assertEqual(
                     [name for name, _state in h.backend.events[before:]],
-                    ["MB1_UP", "R_DOWN", "R_UP"],
+                    ["MB1_UP", "SHIFT_DOWN", "SHIFT_UP"],
                 )
                 self.assertFalse(h.machine.enabled)
                 self.assertFalse(h.machine.firing)
                 self.assertIsNone(h.machine.worker)
-                self.assertIs(h.machine.magazine_state(mode), MagazineState.FULL)
+                self.assertIs(h.machine.magazine_state(mode), MagazineState.UNKNOWN)
                 self.assertEqual(h.audio.events, ["ON", "OFF"])
                 self.assertEqual(
-                    sum(
+                    sum(name == "R_DOWN" for name, _state in h.backend.events),
+                    reloads_before,
+                )
+                self.assertFalse(
+                    any(
                         worker.request.kind is WorkerKind.RELOAD_ONLY
                         for worker in h.workers
-                    ),
-                    1,
+                    )
                 )
                 disabled = [
                     report
@@ -625,6 +644,10 @@ class StateMachineTests(unittest.TestCase):
         self.assertIs(h.machine.worker, macro)
         self.assertTrue(macro.finish_after_reload_requested)
         self.assertEqual(h.audio.events, ["ON", "OFF"])
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in h.backend.events),
+            reloads,
+        )
         macro.complete_macro_reload()
         h.drain()
         self.assertEqual(
@@ -643,7 +666,7 @@ class StateMachineTests(unittest.TestCase):
         before = (
             idle.machine.state,
             idle.machine.generation,
-            len(idle.workers),
+            idle.machine.magazine_state(WeaponMode.PRIMARY),
             tuple(idle.audio.events),
         )
         idle.key_press(VK_LSHIFT, repeats=3)
@@ -652,10 +675,15 @@ class StateMachineTests(unittest.TestCase):
             (
                 idle.machine.state,
                 idle.machine.generation,
-                len(idle.workers),
+                idle.machine.magazine_state(WeaponMode.PRIMARY),
                 tuple(idle.audio.events),
             ),
         )
+        self.assertEqual(
+            [name for name, _state in idle.backend.events],
+            ["SHIFT_DOWN", "SHIFT_UP"],
+        )
+        self.assertNotIn("R_DOWN", [name for name, _state in idle.backend.events])
 
         prep = SimulationHarness(
             CONFIG,
@@ -665,18 +693,28 @@ class StateMachineTests(unittest.TestCase):
         prep.key_press(VK_2)
         worker = prep.machine.worker
         generation = prep.machine.generation
+        reloads = sum(name == "R_DOWN" for name, _state in prep.backend.events)
         prep.key_press(VK_RSHIFT, repeats=3)
         self.assertIs(prep.machine.worker, worker)
         self.assertEqual(prep.machine.generation, generation)
         self.assertEqual(prep.audio.events, [])
         self.assertIsInstance(worker, FakeSessionWorker)
         self.assertFalse(worker.cancel_requested)
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in prep.backend.events),
+            reloads,
+        )
+        self.assertEqual(
+            [name for name, _state in prep.backend.events].count("SHIFT_DOWN"),
+            1,
+        )
 
-    def test_stale_firing_completion_cannot_interfere_with_sprint_reload(self) -> None:
+    def test_stale_firing_completion_cannot_create_reload_after_shift(self) -> None:
         h = SimulationHarness(CONFIG, trace=False, auto_complete_cancel=False)
         h.start(WeaponMode.PRIMARY)
         old = h.machine.worker
         self.assertIsInstance(old, FakeSessionWorker)
+        reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
         h.key_press(VK_LSHIFT)
         self.assertIs(h.machine.state, MacroState.STOPPING)
         self.assertFalse(h.backend.mouse_owned)
@@ -686,7 +724,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertIsNone(h.machine.worker)
         self.assertIs(
             h.machine.magazine_state(WeaponMode.PRIMARY),
-            MagazineState.FULL,
+            MagazineState.UNKNOWN,
         )
         worker_count = len(h.workers)
         h.put_worker_event(
@@ -697,18 +735,54 @@ class StateMachineTests(unittest.TestCase):
         h.drain()
         self.assertEqual(len(h.workers), worker_count)
         self.assertFalse(h.machine.enabled)
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in h.backend.events),
+            reloads,
+        )
 
-    def test_foreground_loss_during_sprint_reload_cancels_and_releases_r(self) -> None:
-        h = SimulationHarness(CONFIG, trace=False)
+    def test_shift_while_macro_is_stopping_never_creates_reload(self) -> None:
+        h = SimulationHarness(CONFIG, trace=False, auto_complete_cancel=False)
         h.start(WeaponMode.PRIMARY)
-        h.auto_complete_preparation = False
         h.key_press(VK_LSHIFT)
-        reload_worker = h.machine.worker
-        self.assertIsInstance(reload_worker, FakeSessionWorker)
-        self.assertIs(reload_worker.request.kind, WorkerKind.RELOAD_ONLY)
-        reload_worker.begin_reload()
-        self.assertTrue(h.backend.reload_owned)
+        self.assertIs(h.machine.state, MacroState.STOPPING)
+        reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
+        shifts = sum(name == "SHIFT_DOWN" for name, _state in h.backend.events)
+        h.key_press(VK_RSHIFT)
+        self.assertIs(h.machine.state, MacroState.STOPPING)
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in h.backend.events),
+            reloads,
+        )
+        self.assertEqual(
+            sum(name == "SHIFT_DOWN" for name, _state in h.backend.events),
+            shifts + 1,
+        )
+        self.assertEqual(h.audio.events, ["ON", "OFF"])
+
+    def test_foreground_loss_during_shift_transaction_releases_all_owned_input(self) -> None:
+        h = SimulationHarness(
+            CONFIG,
+            trace=False,
+            auto_complete_cancel=False,
+            auto_complete_aim_off=False,
+        )
+        h.start(WeaponMode.PRIMARY)
+        h.policy.mouse(WM_RBUTTONDOWN, 0, 0)
+        h.policy.mouse(WM_RBUTTONUP, 0, 0)
+        h.drain()
+        h.key_press(VK_LSHIFT)
+        shift_worker = next(
+            worker
+            for worker in h.workers
+            if worker.request.kind is WorkerKind.SHIFT_TRANSACTION
+        )
+        shift_worker.finish_aim_off()
+        shift_worker.begin_shift_replay()
+        self.assertTrue(h.backend.shift_owned)
         h.foreground_loss()
+        self.assertFalse(h.backend.mouse_owned)
+        self.assertFalse(h.backend.aim_owned)
+        self.assertFalse(h.backend.shift_owned)
         self.assertFalse(h.backend.reload_owned)
         self.assertFalse(h.machine.enabled)
         self.assertIs(
@@ -716,20 +790,41 @@ class StateMachineTests(unittest.TestCase):
             MagazineState.UNKNOWN,
         )
 
-    def test_weapon_selection_invalidates_active_sprint_reload(self) -> None:
+        regained = SimulationHarness(
+            CONFIG,
+            trace=False,
+            auto_complete_cancel=False,
+            auto_complete_aim_off=False,
+        )
+        regained.foreground_loss()
+        regained.foreground.active = True
+        regained.foreground.certain = True
+        regained.key_press(VK_RSHIFT)
+        replay = next(
+            worker
+            for worker in regained.workers
+            if worker.request.kind is WorkerKind.SHIFT_TRANSACTION
+        )
+        replay.begin_shift_replay()
+        self.assertTrue(regained.backend.shift_owned)
+        regained.foreground_loss()
+        self.assertFalse(regained.backend.shift_owned)
+        self.assertIs(regained.machine.aim_state, AimState.UNKNOWN)
+
+    def test_weapon_selection_after_shift_still_prepares_selected_weapon(self) -> None:
         h = SimulationHarness(CONFIG, trace=False)
         h.start(WeaponMode.PRIMARY)
-        h.auto_complete_preparation = False
+        reloads = sum(name == "R_DOWN" for name, _state in h.backend.events)
         h.key_press(VK_LSHIFT)
-        reload_worker = h.machine.worker
-        self.assertIsInstance(reload_worker, FakeSessionWorker)
-        reload_worker.begin_reload()
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in h.backend.events),
+            reloads,
+        )
         h.key_press(VK_2)
-        self.assertFalse(h.backend.reload_owned)
         self.assertIs(h.machine.selected_mode, WeaponMode.SECONDARY)
-        self.assertIs(
-            h.machine.magazine_state(WeaponMode.PRIMARY),
-            MagazineState.UNKNOWN,
+        self.assertEqual(
+            sum(name == "R_DOWN" for name, _state in h.backend.events),
+            reloads + 1,
         )
         self.assertFalse(h.machine.enabled)
 

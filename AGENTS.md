@@ -4,8 +4,8 @@ This is a Python 3.11+, Windows 11 Pro-only, standard-library project. Windows
 APIs are called only through `ctypes`. `main.py` is the CLI; configuration lives
 in `config.toml`. `input_hooks.py` owns the low-level hook/message-loop thread,
 `foreground.py` owns read-only foreground checks, `state_machine.py` owns all
-generation-gated control transitions, `macro_engine.py` owns the active worker
-and short-lived canceled preparation cleanup, and
+generation-gated control transitions, `macro_engine.py` owns the active macro
+worker, deferred Shift transaction, and short-lived canceled preparation cleanup, and
 `input_backend.py` owns marked `SendInput` events, generated-input cleanup, and
 the nonblocking hook/controller cleanup gate. `state_machine.py` tracks separate
 `UNKNOWN`/`FULL` magazine states and owns macro, reload-preparation, and
@@ -29,15 +29,21 @@ SECONDARY is 13 shots at a 120 ms period with MB1 down for 35 ms and an 85 ms
 release interval only between consecutive shots. Its final MB1-up and R-down
 are consecutive with no post-shot wait; its configured complete cycle is
 3,500 ms. Physical MB2 always passes through while the controller tracks only
-an assumed toggle-aim state. Shift conditionally requests one generation-owned,
-tagged MB2 pair only from `AIM_ON`; `AIM_OFF` and `UNKNOWN` never generate MB2.
-When `controls.shift_cancels_aim_natively` is true, Shift generates no MB2 and
-records assumed aim OFF.
+an assumed toggle-aim state. Foreground physical Shift pairs are pair-latched,
+suppressed, and replayed once with the same Left/Right scan code. Active firing
+is disabled and owned MB1 is released before conditional aim-off; a tagged MB2
+pair is generated only from `AIM_ON`, and its up precedes replayed Shift-down.
+`AIM_OFF` and `UNKNOWN` never generate MB2. Shift never initiates reload work.
+An already-active reload may finish while sprinting. When
+`controls.shift_cancels_aim_natively` is true, Shift generates no MB2 and
+records assumed aim OFF only after successful Shift replay. Persistent sprint
+remains game-owned; later physical MB2 pairs never generate Shift.
 
 Never read or depend on Lua, Logitech G HUB, AutoHotkey, drivers, game memory,
 injection, interception, hardware emulation, anti-cheat workarounds, network
 traffic, third-party packages, or administrator access. Only `--live` may
-install hooks, suppress paired physical MB1 events, or call `SendInput`.
+install hooks, suppress paired physical MB1/foreground Shift events, or call
+`SendInput`.
 
 Authorized validation commands:
 
@@ -61,13 +67,13 @@ macro; at most one macro worker; `FULL` is set only by verified reload completio
 same-mode duplicate selections preserve the active generation; background
 preparation ends armed/FULL or idle/UNKNOWN unless immediate MB1 invalidates it;
 immediate fire never waits for preparation; ON/OFF transitions are deduplicated; audio test shutdown drains
-accepted tones and exposes worker failures; all owned MB1/MB2/R downs are released
+accepted tones and exposes worker failures; all owned MB1/MB2/Shift/R downs are released
 on every exit; MB1-down is the only toggle edge and MB1-up is cleanup-only;
 same-mode selection and MB2 cannot mutate macro state; Ctrl cannot restart
 canceled work; foreground regain requires neutral physical input and never
-auto-restarts; physical Shift always passes through, disables active firing once,
-preserves an existing reload or begins exactly one reload-only sequence after
-firing cleanup, and never restarts firing; scenarios A-AC and all authorized
-validation commands pass.
+auto-restarts; foreground physical Shift is deferred once per pair, disables
+active firing once, conditionally exits aim before same-scan Shift replay,
+preserves an existing reload, never initiates `R`, and never restarts firing;
+scenarios A-AJ and all authorized validation commands pass.
 Ctrl-bypass and state-trace diagnostics default off and never log unrelated
 input; trace reasons are transition-local and include elapsed milliseconds.

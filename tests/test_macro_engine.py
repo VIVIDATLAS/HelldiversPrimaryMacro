@@ -37,6 +37,8 @@ class RecordingBackend:
         self.timed_events: list[tuple[str, int]] = []
         self.mouse_owned = False
         self.aim_owned = False
+        self.shift_owned = False
+        self.shift_scan = 0
         self.reload_owned = False
         self.fail_on = fail_on
         self.release_calls = 0
@@ -68,6 +70,18 @@ class RecordingBackend:
         self._event("MB2_UP")
         self.aim_owned = False
 
+    def shift_down(self, scan_code: int) -> None:
+        self.shift_owned = True
+        self.shift_scan = scan_code
+        self._event("SHIFT_DOWN")
+
+    def shift_up(self) -> None:
+        if not self.shift_owned:
+            return
+        self._event("SHIFT_UP")
+        self.shift_owned = False
+        self.shift_scan = 0
+
     def reload_down(self) -> None:
         self.reload_owned = True
         self._event("R_DOWN")
@@ -86,9 +100,22 @@ class RecordingBackend:
         if self.aim_owned:
             self._event("RELEASE_MB2")
             self.aim_owned = False
+        if self.shift_owned:
+            self._event("RELEASE_SHIFT")
+            self.shift_owned = False
+            self.shift_scan = 0
         if self.reload_owned:
             self._event("RELEASE_R")
             self.reload_owned = False
+
+    def release_shift_inputs(self) -> None:
+        if self.aim_owned:
+            self._event("RELEASE_MB2")
+            self.aim_owned = False
+        if self.shift_owned:
+            self._event("RELEASE_SHIFT")
+            self.shift_owned = False
+            self.shift_scan = 0
 
 
 class FakeTime:
@@ -409,7 +436,46 @@ class MacroSequenceTests(unittest.TestCase):
                 self.assertFalse(backend.mouse_owned)
                 self.assertFalse(backend.reload_owned)
 
-    def test_owned_aim_off_pair_has_no_wait_and_cleans_up(self) -> None:
+    def test_shift_transaction_orders_aim_off_before_same_scan_replay(self) -> None:
+        fake_time = FakeTime()
+        backend = RecordingBackend(clock=fake_time.clock)
+        progress = []
+        result = MacroEngine(
+            CONFIG,
+            backend,
+            lambda: True,
+            clock=fake_time.clock,
+            wait=fake_time.wait,
+        ).send_shift_transaction(
+            0x36,
+            True,
+            threading.Event(),
+            threading.Event(),
+            progress.append,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(
+            backend.timed_events,
+            [
+                ("MB2_DOWN", 0),
+                ("MB2_UP", 20),
+                ("SHIFT_DOWN", 20),
+                ("SHIFT_UP", 40),
+            ],
+        )
+        self.assertEqual(backend.shift_scan, 0)
+        self.assertEqual(
+            [update.phase for update in progress],
+            [
+                WorkerProgress.AIM_OFF_SENT,
+                WorkerProgress.SHIFT_REPLAY_DOWN,
+                WorkerProgress.SHIFT_REPLAY_UP,
+            ],
+        )
+        self.assertFalse(backend.aim_owned)
+        self.assertFalse(backend.shift_owned)
+
+    def test_shift_transaction_skips_mb2_when_aim_is_not_known_on(self) -> None:
         fake_time = FakeTime()
         backend = RecordingBackend(clock=fake_time.clock)
         result = MacroEngine(
@@ -418,13 +484,42 @@ class MacroSequenceTests(unittest.TestCase):
             lambda: True,
             clock=fake_time.clock,
             wait=fake_time.wait,
-        ).send_aim_off(threading.Event(), threading.Event())
+        ).send_shift_transaction(
+            0x2A,
+            False,
+            threading.Event(),
+            threading.Event(),
+        )
         self.assertTrue(result.success)
         self.assertEqual(
             backend.timed_events,
-            [("MB2_DOWN", 0), ("MB2_UP", 0)],
+            [("SHIFT_DOWN", 0), ("SHIFT_UP", 20)],
         )
-        self.assertFalse(backend.aim_owned)
+
+    def test_shift_transaction_waits_never_hold_output_lock(self) -> None:
+        fake_time = FakeTime()
+        backend = RecordingBackend(clock=fake_time.clock)
+        lock = TrackingLock()
+
+        def wait(event: threading.Event, seconds: float) -> bool:
+            self.assertFalse(lock.held)
+            return fake_time.wait(event, seconds)
+
+        result = MacroEngine(
+            CONFIG,
+            backend,
+            lambda: True,
+            clock=fake_time.clock,
+            wait=wait,
+            io_lock=lock,
+        ).send_shift_transaction(
+            0x2A,
+            True,
+            threading.Event(),
+            threading.Event(),
+        )
+        self.assertTrue(result.success)
+        self.assertFalse(lock.held)
 
     def test_macro_waits_never_hold_output_lock(self) -> None:
         backend = RecordingBackend()

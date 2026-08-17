@@ -12,6 +12,7 @@ from helldivers_macro.input_hooks import (
     VK_LCONTROL,
     VK_LSHIFT,
     VK_RSHIFT,
+    SHIFT_SCAN_CODES,
     VK_NUMPAD1,
     VK_NUMPAD2,
     WM_KEYDOWN,
@@ -22,7 +23,7 @@ from helldivers_macro.input_hooks import (
     WM_RBUTTONUP,
     validate_hook_layouts,
 )
-from helldivers_macro.models import ControlEventKind
+from helldivers_macro.models import ControlEventKind, ShiftStroke
 
 
 class HookPolicyTests(unittest.TestCase):
@@ -223,21 +224,25 @@ class HookPolicyTests(unittest.TestCase):
             ],
         )
 
-    def test_right_click_and_shift_edges_pass_and_normalize(self) -> None:
+    def test_right_click_passes_and_foreground_shift_pair_is_deferred(self) -> None:
         policy = self.make_policy()
         self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
         self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
-        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
-        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0))
-        self.assertFalse(policy.keyboard(WM_KEYUP, VK_LSHIFT, 0))
+        scan = SHIFT_SCAN_CODES[VK_LSHIFT]
+        self.assertTrue(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0, scan))
+        self.assertTrue(policy.keyboard(WM_KEYDOWN, VK_LSHIFT, 0, scan))
+        self.assertTrue(policy.keyboard(WM_KEYUP, VK_LSHIFT, 0, scan))
         self.assertEqual(
             self.kinds(),
             [
                 ControlEventKind.PHYSICAL_MB2_DOWN,
                 ControlEventKind.PHYSICAL_MB2_UP,
                 ControlEventKind.SHIFT_DOWN,
-                ControlEventKind.SHIFT_UP,
             ],
+        )
+        self.assertEqual(
+            self.events[-1].detail,
+            ShiftStroke(VK_LSHIFT, scan),
         )
 
     def test_right_button_repeat_emits_one_physical_down_edge(self) -> None:
@@ -256,18 +261,37 @@ class HookPolicyTests(unittest.TestCase):
     def test_left_and_right_shift_autorepeat_emit_one_actionable_edge_each(self) -> None:
         policy = self.make_policy()
         for vk_code in (VK_LSHIFT, VK_RSHIFT):
-            self.assertFalse(policy.keyboard(WM_KEYDOWN, vk_code, 0))
-            self.assertFalse(policy.keyboard(WM_KEYDOWN, vk_code, 0))
-            self.assertFalse(policy.keyboard(WM_KEYUP, vk_code, 0))
+            scan = SHIFT_SCAN_CODES[vk_code]
+            self.assertTrue(policy.keyboard(WM_KEYDOWN, vk_code, 0, scan))
+            self.assertTrue(policy.keyboard(WM_KEYDOWN, vk_code, 0, scan))
+            self.assertTrue(policy.keyboard(WM_KEYUP, vk_code, 0, scan))
         self.assertEqual(
             self.kinds(),
             [
                 ControlEventKind.SHIFT_DOWN,
-                ControlEventKind.SHIFT_UP,
                 ControlEventKind.SHIFT_DOWN,
-                ControlEventKind.SHIFT_UP,
             ],
         )
+
+    def test_shift_outside_target_passes_without_controller_event(self) -> None:
+        policy = self.make_policy((False, True))
+        scan = SHIFT_SCAN_CODES[VK_RSHIFT]
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_RSHIFT, 0, scan))
+        self.assertFalse(policy.keyboard(WM_KEYDOWN, VK_RSHIFT, 0, scan))
+        self.assertFalse(policy.keyboard(WM_KEYUP, VK_RSHIFT, 0, scan))
+        self.assertEqual(self.events, [])
+
+    def test_generated_or_marked_shift_is_ignored_without_recursion(self) -> None:
+        policy = self.make_policy()
+        scan = SHIFT_SCAN_CODES[VK_LSHIFT]
+        for flags, marker in ((LLKHF_INJECTED, 0), (0, INPUT_MARKER)):
+            self.assertFalse(
+                policy.keyboard(WM_KEYDOWN, VK_LSHIFT, flags, scan, marker)
+            )
+            self.assertFalse(
+                policy.keyboard(WM_KEYUP, VK_LSHIFT, flags, scan, marker)
+            )
+        self.assertEqual(self.events, [])
 
     def test_diagnostics_ignore_unrelated_input(self) -> None:
         self.status = (True, True)

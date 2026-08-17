@@ -20,7 +20,7 @@ project does not provide a bypass or elevated-mode workaround.
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
 6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through AC with fake hooks, input, foreground, time, workers,
+   scenarios A through AJ with fake hooks, input, foreground, time, workers,
    and audio only.
 7. Review both dry runs before deliberately choosing `--live`.
 
@@ -184,29 +184,48 @@ updates a conservative assumed state from `AIM_OFF` to `AIM_ON`, or from
 disables, starts, stops, reloads, or emits macro audio. Tagged/generated and
 other injected MB2 events are ignored by the hook.
 
-Physical Left and Right Shift are the game's toggle-sprint inputs and always
-pass through unchanged. Only the first non-injected down edge while held is
-actionable. If the macro is actively firing, Shift disables it, queues exactly
-one OFF notification, releases generated MB1, prevents later shots, and begins
-one reload-only sequence after the firing worker has retired. Reload is allowed
-while sprinting. A valid reload may publish `FULL`, but the macro remains
-disabled and MB1 must be pressed again to resume firing.
+Physical Left and Right Shift are the game's toggle-sprint inputs. While the
+target is confirmed foreground, the hook pair-latches and suppresses one
+physical Shift down/up pair, including repeat downs, and queues one deferred
+transaction carrying the same Left/Right scan code. Outside Helldivers the pair
+passes through unchanged and creates no controller event. Tagged/generated
+Shift events are ignored by the hook and cannot recurse.
 
-If Shift arrives after the active macro has already entered its reload phase,
-the existing `R` press/reload wait is allowed to finish without cancellation or
-a duplicate reload. The worker stops before another firing cycle. Shift while
-disabled and idle or during selection preparation is pass-through-only; it does
-not change generation, start work, cancel preparation, or emit audio. Shift-up
-only clears the physical hook latch and never changes controller state.
+The deferred transaction is ordered as follows:
+
+```text
+disable active firing and release owned MB1, if needed
+conditional owned MB2-down/up when assumed aim is ON
+owned replay of the same physical Shift scan-code down/up
+```
+
+Aim-off therefore completes before Helldivers receives the sprint toggle. If
+active firing was stopped, OFF is queued exactly once and the selected magazine
+is marked conservatively. Shift never presses `R` and never creates a
+reload-only worker. While disabled and idle it changes no macro state,
+ammunition state, generation, or audio. During weapon-selection preparation it
+does not cancel the existing preparation or create a second reload.
+
+If Shift arrives after a normal macro cycle has already entered its reload
+phase, that existing `R` press and reload wait may finish and publish its valid
+result. Shift does not cancel it merely because sprinting permits reload, and
+does not press `R` again. The macro remains disabled afterward; MB1 must be
+pressed again to resume firing.
 
 The live controller starts with assumed `AIM_OFF`. With the default
-`controls.shift_cancels_aim_natively = false`, the first Shift-down sends one
-owned/tagged MB2 down/up pair only when the assumed state is `AIM_ON`. It first
-moves to `AIM_OFF_PENDING`, then publishes `AIM_OFF` only after successful
-delivery. `AIM_OFF` and `UNKNOWN` never generate MB2, so Shift cannot blindly
-start aiming. Repeats and Shift-up do not send additional clicks. A physical
-MB2 edge or foreground loss invalidates pending output; failure or obsolete
-completion leaves the state `UNKNOWN` and is never retried blindly.
+`controls.shift_cancels_aim_natively = false`, a deferred Shift sends one
+owned/tagged MB2 down/up pair only from `AIM_ON`. It first publishes
+`AIM_OFF_PENDING`, then `AIM_OFF` after successful MB2 delivery, and only then
+replays Shift. `AIM_OFF` and `UNKNOWN` never generate MB2, so Shift cannot
+blindly start aiming. A physical MB2 edge or foreground loss invalidates
+obsolete pending work; failures leave the inferred state conservative and are
+never retried blindly.
+
+Sprint is a persistent game-side toggle. After the one replayed Shift pair,
+physical RMB continues to pass through normally. Toggling aim ON and then OFF
+does not generate another Shift, reload, or macro transition; Helldivers is
+responsible for resuming persistent sprint. A second deliberate physical Shift
+creates exactly one second replay pair so the game can toggle sprint OFF.
 
 If Helldivers itself cancels toggle aim when Shift begins sprinting, set:
 
@@ -216,7 +235,9 @@ shift_cancels_aim_natively = true
 ```
 
 In that mode Shift emits no generated MB2 and records the assumed state as
-`AIM_OFF`. If Shift ever causes aiming to turn on, enable this option.
+`AIM_OFF` only after the replayed Shift pair succeeds, because native Shift is
+configured to cancel aim. If Shift ever causes aiming to turn on, enable this
+option.
 
 For narrow Ctrl troubleshooting, set
 `diagnostics.ctrl_bypass_logging = true`. It logs only Ctrl cleanup state, MB1
@@ -242,8 +263,10 @@ options are disabled by default and never log unrelated user input.
 `SAME_MODE_SELECTION_IGNORED` is the only optional trace record for an
 otherwise inert same-mode selection.
 
-Conditional aim tracing is limited to `AIM_PHYSICAL_ON`, `AIM_PHYSICAL_OFF`,
-`AIM_OFF_REQUESTED`, `AIM_OFF_SENT`, `AIM_OFF_SKIPPED`, and `AIM_OFF_FAILED`.
+Deferred sprint tracing is limited to low-volume transitions including
+`SHIFT_DEFERRED`, `SHIFT_TRANSACTION_STARTED`, `AIM_OFF_REQUESTED`,
+`AIM_OFF_SENT`, `AIM_OFF_SKIPPED`, `SHIFT_REPLAY_DOWN`, `SHIFT_REPLAY_UP`,
+`SHIFT_TRANSACTION_COMPLETED`, and `SHIFT_TRANSACTION_FAILED`.
 
 Reload diagnostics use transition-local worker phases `FINAL_SHOT_DOWN`,
 `FINAL_SHOT_UP`, `RELOAD_KEY_DOWN`, `RELOAD_KEY_UP`,
@@ -316,7 +339,7 @@ and reload work if it finishes before activation. Every macro/preparation wait
 checks cancellation and fresh foreground ownership at 5 ms intervals.
 
 The shared output lock is held only around short consecutive output groups and
-cleanup, never during switch-settle, press-duration, or reload waits. Immediate start
+cleanup, never during switch-settle, click/key press-duration, or reload waits. Immediate start
 signals preparation cancellation without acquiring that lock or joining the
 thread. A retired preparation may release only its owned `R`; it cannot release
 the current macro's MB1. State and generated-input ownership are published
@@ -326,8 +349,7 @@ before the firing worker is activated.
 
 - ON: 1000 Hz for 100 ms, queued once on an accepted immediate enable edge.
 - OFF: 500 Hz for 150 ms, exactly once when an enabled macro is disabled. Shift
-  queues OFF immediately before the allowed sprint reload; other stop paths
-  retain their deterministic cleanup ordering.
+  queues OFF once when it stops active firing; idle Shift is silent.
 
 Preparation, selection, startup, and idle cancellation are silent. Audio uses a
 dedicated FIFO thread and cannot delay hook callbacks, input release, or timing.
@@ -348,17 +370,18 @@ python main.py --test-audio
 python main.py --live
 ```
 
-Only `--live` installs hooks, suppresses paired physical MB1, or generates
+Only `--live` installs hooks, suppresses paired physical MB1/foreground Shift, or generates
 input. `--test-audio` plays only the configured tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through AC and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+A through AJ and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
 the existing controller regressions plus immediate UNKNOWN start, switch-settle
 preemption, active-reload preemption, immediate stop, and first-cycle reload
 synchronization all pass. Scenario V verifies zero-gap SECONDARY reload;
-scenarios W through AA preserve PRIMARY, sprint-reload, and physical toggle-aim
-coverage; scenarios AB and AC verify conditional aim-off delivery, stale
-invalidation, foreground cleanup, and native Shift mode.
+scenarios W through AC preserve timing, reload, and toggle-aim regressions;
+scenarios AD through AJ verify firing/idle conditional aim-off ordering,
+persistent-sprint RMB isolation, a second sprint toggle, existing-reload
+preservation, zero Shift-created `R`, and foreground cleanup.
 
 The complete non-live validation set is:
 

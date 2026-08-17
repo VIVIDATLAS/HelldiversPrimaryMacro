@@ -108,7 +108,7 @@ def validate_ctypes_layouts() -> None:
 
 
 class SendInputBackend:
-    """Owns generated MB1/MB2/R downs and releases only owned inputs."""
+    """Owns generated MB1/MB2/Shift/R downs and releases only owned inputs."""
 
     def __init__(self, *, user32: object | None = None) -> None:
         validate_ctypes_layouts()
@@ -131,6 +131,8 @@ class SendInputBackend:
         self._lock = threading.RLock()
         self._mouse_owned = False
         self._aim_owned = False
+        self._shift_owned = False
+        self._shift_scan = 0
         self._reload_owned = False
 
     @property
@@ -152,6 +154,11 @@ class SendInputBackend:
         with self._lock:
             return self._aim_owned
 
+    @property
+    def shift_owned(self) -> bool:
+        with self._lock:
+            return self._shift_owned
+
     def _send_exactly_one(self, input_value: INPUT, description: str) -> None:
         ctypes.set_last_error(0)
         accepted = int(
@@ -169,10 +176,11 @@ class SendInputBackend:
         value.mi = MOUSEINPUT(0, 0, 0, flags, 0, INPUT_MARKER)
         return value
 
-    def _keyboard_input(self, *, key_up: bool) -> INPUT:
+    @staticmethod
+    def _keyboard_input(scan_code: int, *, key_up: bool) -> INPUT:
         flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if key_up else 0)
         value = INPUT(type=INPUT_KEYBOARD)
-        value.ki = KEYBDINPUT(0, self._r_scan, flags, 0, INPUT_MARKER)
+        value.ki = KEYBDINPUT(0, scan_code, flags, 0, INPUT_MARKER)
         return value
 
     def mouse_down(self) -> None:
@@ -207,19 +215,62 @@ class SendInputBackend:
             )
             self._aim_owned = False
 
+    def shift_down(self, scan_code: int) -> None:
+        with self._lock:
+            if self._shift_owned:
+                raise InputApiError("refusing duplicate generated Shift down")
+            if not 0 < scan_code <= 0xFFFF:
+                raise InputApiError(f"invalid physical Shift scan code {scan_code}")
+            self._send_exactly_one(
+                self._keyboard_input(scan_code, key_up=False), "Shift down"
+            )
+            self._shift_scan = scan_code
+            self._shift_owned = True
+
+    def shift_up(self) -> None:
+        with self._lock:
+            if not self._shift_owned:
+                return
+            self._send_exactly_one(
+                self._keyboard_input(self._shift_scan, key_up=True), "Shift up"
+            )
+            self._shift_owned = False
+            self._shift_scan = 0
+
     def reload_down(self) -> None:
         with self._lock:
             if self._reload_owned:
                 raise InputApiError("refusing duplicate generated R down")
-            self._send_exactly_one(self._keyboard_input(key_up=False), "R down")
+            self._send_exactly_one(
+                self._keyboard_input(self._r_scan, key_up=False), "R down"
+            )
             self._reload_owned = True
 
     def reload_up(self) -> None:
         with self._lock:
             if not self._reload_owned:
                 return
-            self._send_exactly_one(self._keyboard_input(key_up=True), "R up")
+            self._send_exactly_one(
+                self._keyboard_input(self._r_scan, key_up=True), "R up"
+            )
             self._reload_owned = False
+
+    def release_shift_inputs(self) -> None:
+        """Release only inputs a deferred Shift transaction can own."""
+        errors: list[str] = []
+        with self._lock:
+            if self._aim_owned:
+                try:
+                    self.aim_up()
+                except InputApiError as exc:
+                    errors.append(str(exc))
+            if self._shift_owned:
+                try:
+                    self.shift_up()
+                except InputApiError as exc:
+                    errors.append(str(exc))
+        if errors:
+            raise InputApiError("; ".join(errors))
 
     def release_all(self) -> None:
         errors: list[str] = []
@@ -232,6 +283,11 @@ class SendInputBackend:
             if self._aim_owned:
                 try:
                     self.aim_up()
+                except InputApiError as exc:
+                    errors.append(str(exc))
+            if self._shift_owned:
+                try:
+                    self.shift_up()
                 except InputApiError as exc:
                     errors.append(str(exc))
             if self._reload_owned:

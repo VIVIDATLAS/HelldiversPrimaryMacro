@@ -86,6 +86,35 @@ class InputBackendTests(unittest.TestCase):
         )
         self.assertFalse(backend.aim_owned)
 
+    def test_shift_replay_preserves_scan_code_and_is_marked_owned(self) -> None:
+        user = FakeUser32()
+        backend = SendInputBackend(user32=user)
+        backend.shift_down(0x36)
+        backend.shift_up()
+        self.assertEqual([item.ki.wScan for item in user.inputs], [0x36, 0x36])
+        self.assertEqual(
+            [item.ki.dwFlags for item in user.inputs],
+            [KEYEVENTF_SCANCODE, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP],
+        )
+        self.assertTrue(
+            all(item.ki.dwExtraInfo == INPUT_MARKER for item in user.inputs)
+        )
+        self.assertFalse(backend.shift_owned)
+
+    def test_shift_cleanup_does_not_release_macro_or_reload_inputs(self) -> None:
+        user = FakeUser32()
+        backend = SendInputBackend(user32=user)
+        backend.mouse_down()
+        backend.reload_down()
+        backend.aim_down()
+        backend.shift_down(0x2A)
+        backend.release_shift_inputs()
+        self.assertTrue(backend.mouse_owned)
+        self.assertTrue(backend.reload_owned)
+        self.assertFalse(backend.aim_owned)
+        self.assertFalse(backend.shift_owned)
+        backend.release_all()
+
     def test_failed_up_retains_ownership_and_cleanup_retries(self) -> None:
         user = FakeUser32([1, 0, 1])
         backend = SendInputBackend(user32=user)
@@ -105,12 +134,14 @@ class InputBackendTests(unittest.TestCase):
         backend = SendInputBackend(user32=user)
         backend.mouse_down()
         backend.aim_down()
+        backend.shift_down(0x2A)
         backend.reload_down()
         backend.release_all()
         self.assertFalse(backend.mouse_owned)
         self.assertFalse(backend.aim_owned)
+        self.assertFalse(backend.shift_owned)
         self.assertFalse(backend.reload_owned)
-        self.assertEqual(len(user.inputs), 6)
+        self.assertEqual(len(user.inputs), 8)
 
     def test_duplicate_down_is_refused_without_extra_input(self) -> None:
         user = FakeUser32()

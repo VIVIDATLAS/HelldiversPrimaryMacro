@@ -7,7 +7,13 @@ import threading
 from typing import Callable
 
 from .input_backend import INPUT_MARKER, ULONG_PTR, InputCoordination
-from .models import ControlEvent, ControlEventKind, EventSource, Mb1PairDecision
+from .models import (
+    ControlEvent,
+    ControlEventKind,
+    EventSource,
+    Mb1PairDecision,
+    ShiftStroke,
+)
 
 
 WH_KEYBOARD_LL = 13
@@ -35,6 +41,7 @@ VK_LSHIFT = 0xA0
 VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
+SHIFT_SCAN_CODES = {VK_LSHIFT: 0x2A, VK_RSHIFT: 0x36}
 
 LRESULT = ctypes.c_ssize_t
 CALLBACK_FACTORY = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
@@ -93,6 +100,7 @@ class HookPolicy:
         self._left_pair_decision: Mb1PairDecision | None = None
         self._left_pair_is_manual = False
         self._right_pair_down = False
+        self._deferred_shift_pairs: set[int] = set()
 
     @property
     def ctrl_down(self) -> bool:
@@ -118,13 +126,22 @@ class HookPolicy:
         if self._diagnostics_enabled:
             self._emit(ControlEventKind.DIAGNOSTIC, message)
 
-    def keyboard(self, message: int, vk_code: int, flags: int) -> bool:
-        """Observe a keyboard event. The return is always False (never suppress)."""
-        if flags & LLKHF_INJECTED:
+    def keyboard(
+        self,
+        message: int,
+        vk_code: int,
+        flags: int,
+        scan_code: int = 0,
+        extra_info: int = 0,
+    ) -> bool:
+        """Observe keys and defer foreground physical Shift pairs."""
+        pointer_mask = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+        marked = (int(extra_info) & pointer_mask) == (INPUT_MARKER & pointer_mask)
+        if marked or flags & LLKHF_INJECTED:
             return False
         if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
             if vk_code in self._keys_down:
-                return False
+                return vk_code in self._deferred_shift_pairs
             self._keys_down.add(vk_code)
             if vk_code in (VK_LCONTROL, VK_RCONTROL):
                 # Publish physical Ctrl and the cancellation gate before any
@@ -137,10 +154,20 @@ class HookPolicy:
                     )
                 self._emit(ControlEventKind.CTRL_DOWN)
             elif vk_code in (VK_LSHIFT, VK_RSHIFT):
-                # Shift always passes through. Only its first physical down
-                # edge is normalized for the controller; repeats are rejected
-                # by the key latch above.
-                self._emit(ControlEventKind.SHIFT_DOWN, detail=vk_code)
+                active, _certain = self._foreground_status()
+                if active:
+                    # The pair latch suppresses this edge, autorepeat, and the
+                    # matching up. The controller later replays one owned pair
+                    # after firing cleanup and conditional aim cancellation.
+                    self._deferred_shift_pairs.add(vk_code)
+                    self._emit(
+                        ControlEventKind.SHIFT_DOWN,
+                        detail=ShiftStroke(
+                            vk_code,
+                            scan_code or SHIFT_SCAN_CODES[vk_code],
+                        ),
+                    )
+                    return True
             elif vk_code in (VK_1, VK_2):
                 active, certain = self._foreground_status()
                 if active:
@@ -159,8 +186,11 @@ class HookPolicy:
             self._keys_down.discard(vk_code)
             if was_down and vk_code in (VK_LCONTROL, VK_RCONTROL):
                 self._emit(ControlEventKind.CTRL_UP)
-            elif was_down and vk_code in (VK_LSHIFT, VK_RSHIFT):
-                self._emit(ControlEventKind.SHIFT_UP, detail=vk_code)
+            elif vk_code in (VK_LSHIFT, VK_RSHIFT):
+                deferred = vk_code in self._deferred_shift_pairs
+                self._deferred_shift_pairs.discard(vk_code)
+                if deferred:
+                    return True
         return False
 
     def mouse(self, message: int, flags: int, extra_info: int) -> bool:
@@ -352,7 +382,14 @@ class WindowsHookThread:
             return self._call_next(code, wparam, lparam)
         try:
             data = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            self._policy.keyboard(int(wparam), int(data.vkCode), int(data.flags))
+            if self._policy.keyboard(
+                int(wparam),
+                int(data.vkCode),
+                int(data.flags),
+                int(data.scanCode),
+                int(data.dwExtraInfo),
+            ):
+                return 1
         except BaseException as exc:
             self._event_sink(
                 ControlEvent(
