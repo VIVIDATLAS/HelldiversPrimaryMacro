@@ -15,6 +15,8 @@ from .input_hooks import (
     VK_LCONTROL,
     VK_LSHIFT,
     VK_RSHIFT,
+    VK_F23,
+    VK_F24,
     WM_KEYDOWN,
     WM_KEYUP,
     WM_LBUTTONDOWN,
@@ -39,6 +41,7 @@ from .models import (
     WorkerResult,
 )
 from .state_machine import MacroStateMachine
+from .stratagems import FOUR_TARGET_SEQUENCES, SUPPORT_SEQUENCES
 
 
 class FakeClock:
@@ -98,6 +101,10 @@ class FakeGeneratedInput:
         self.shift_scan = 0
         self.shift_scans: list[int] = []
         self.reload_owned = False
+        self.stratagem_owner: int | None = None
+        self.stratagem_scan: tuple[int, bool] | None = None
+        self.stratagem_ctrl_owned = False
+        self.stratagem_mouse_owned = False
 
     def _record(self, name: str) -> None:
         state = self._state_probe()
@@ -167,6 +174,8 @@ class FakeGeneratedInput:
             self.reload_owned = False
 
     def release_all(self) -> None:
+        if self.stratagem_owner is not None:
+            self.release_stratagem(self.stratagem_owner)
         self.mouse_up()
         self.aim_up()
         self.shift_up()
@@ -175,6 +184,54 @@ class FakeGeneratedInput:
     def release_shift_inputs(self) -> None:
         self.aim_up()
         self.shift_up()
+
+    def stratagem_key_down(
+        self, token: int, scan_code: int, *, extended: bool, ctrl: bool = False
+    ) -> None:
+        if self.stratagem_owner not in (None, token):
+            raise RuntimeError("fake stratagem owner conflict")
+        self.stratagem_owner = token
+        if ctrl:
+            self.stratagem_ctrl_owned = True
+            self._record("CTRL_DOWN")
+        else:
+            self.stratagem_scan = (scan_code, extended)
+            self._record(f"ARROW_{scan_code:02X}_DOWN_EXTENDED")
+
+    def stratagem_key_up(
+        self, token: int, scan_code: int, *, extended: bool, ctrl: bool = False
+    ) -> None:
+        if self.stratagem_owner != token:
+            return
+        if ctrl and self.stratagem_ctrl_owned:
+            self._record("CTRL_UP")
+            self.stratagem_ctrl_owned = False
+        elif not ctrl and self.stratagem_scan == (scan_code, extended):
+            self._record(f"ARROW_{scan_code:02X}_UP_EXTENDED")
+            self.stratagem_scan = None
+
+    def stratagem_mouse_down(self, token: int) -> None:
+        if self.stratagem_owner not in (None, token):
+            raise RuntimeError("fake stratagem owner conflict")
+        self.stratagem_owner = token
+        self.stratagem_mouse_owned = True
+        self._record("STRATAGEM_MB1_DOWN")
+
+    def stratagem_mouse_up(self, token: int) -> None:
+        if self.stratagem_owner == token and self.stratagem_mouse_owned:
+            self._record("STRATAGEM_MB1_UP")
+            self.stratagem_mouse_owned = False
+
+    def release_stratagem(self, token: int) -> None:
+        if self.stratagem_owner != token:
+            return
+        if self.stratagem_scan is not None:
+            scan, extended = self.stratagem_scan
+            self.stratagem_key_up(token, scan, extended=extended)
+        if self.stratagem_ctrl_owned:
+            self.stratagem_key_up(token, 0x1D, extended=False, ctrl=True)
+        self.stratagem_mouse_up(token)
+        self.stratagem_owner = None
 
 
 class FakeSessionWorker:
@@ -252,6 +309,15 @@ class FakeSessionWorker:
                 self.harness.clock.advance_ms(self.request.bypass_click_ms)
                 self.harness.backend.mouse_up()
                 self.finish(WorkerResult(True))
+        elif self.request.kind is WorkerKind.STRATAGEM:
+            if self.harness.auto_complete_stratagem:
+                result = self.harness.engine.run_stratagem(
+                    self.token,
+                    self.request.stratagem_sequences,
+                    threading.Event(),
+                    threading.Event(),
+                )
+                self.finish(result)
 
     def finish_preparation(self, result: WorkerResult | None = None) -> None:
         if result is None:
@@ -506,6 +572,8 @@ class FakeSessionWorker:
                 self.harness.backend.release_shift_inputs()
             elif self.request.kind is WorkerKind.BYPASS:
                 self.harness.backend.mouse_up()
+            elif self.request.kind is WorkerKind.STRATAGEM:
+                self.harness.backend.release_stratagem(self.token)
             else:
                 self.harness.backend.release_all()
         except BaseException as exc:
@@ -564,6 +632,7 @@ class SimulationHarness:
         auto_complete_preparation: bool = True,
         auto_complete_cancel: bool = True,
         auto_complete_aim_off: bool = True,
+        auto_complete_stratagem: bool = True,
         foreground_active: bool = True,
         foreground_certain: bool = True,
     ) -> None:
@@ -574,6 +643,7 @@ class SimulationHarness:
         self.auto_complete_preparation = auto_complete_preparation
         self.auto_complete_cancel = auto_complete_cancel
         self.auto_complete_shift = auto_complete_aim_off
+        self.auto_complete_stratagem = auto_complete_stratagem
         self.foreground = FakeForeground(
             foreground_active,
             foreground_certain,
@@ -619,6 +689,13 @@ class SimulationHarness:
             self.put_hook_event,
             self.backend.mouse_owned_snapshot,
             self.coordination,
+            stratagem_triggers=(
+                {
+                    (VK_F23 if self.config.stratagems.four_target_trigger == "F23" else VK_F24): ControlEventKind.STRATAGEM_FOUR,
+                    (VK_F23 if self.config.stratagems.support_trigger == "F23" else VK_F24): ControlEventKind.STRATAGEM_SUPPORT,
+                }
+                if self.config.stratagems.enabled else {}
+            ),
         )
 
     def put_hook_event(self, event: ControlEvent) -> None:
@@ -1970,6 +2047,170 @@ def _scenario_at(config: AppConfig) -> str:
     return "PowerShell baseline then target RMB/MB1 reached FIRING_STARTED"
 
 
+def _scenario_au(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    started = h.clock()
+    assert h.key_press(VK_F23, repeats=4) == (True,) * 6
+    assert round((h.clock() - started) * 1000) == 4200
+    arrows = [
+        int(name[6:8], 16)
+        for name, _state in h.backend.events
+        if name.startswith("ARROW_") and name.endswith("_DOWN_EXTENDED")
+    ]
+    assert arrows == [direction.scan_code for entry in FOUR_TARGET_SEQUENCES for direction in entry]
+    assert sum(name == "STRATAGEM_MB1_DOWN" for name, _ in h.backend.events) == 4
+    assert h.audio.events == [] and h.machine.state is MacroState.IDLE_PRIMARY
+
+    support = SimulationHarness(config)
+    started = support.clock()
+    assert support.key_press(VK_F24) == (True, True)
+    assert round((support.clock() - started) * 1000) == 2040
+    arrows = [
+        int(name[6:8], 16)
+        for name, _state in support.backend.events
+        if name.startswith("ARROW_") and name.endswith("_DOWN_EXTENDED")
+    ]
+    assert arrows == [direction.scan_code for entry in SUPPORT_SEQUENCES for direction in entry]
+    assert support.audio.events == [] and not support.machine.enabled
+    return "F23/F24 exact immutable sequences completed in 4200/2040 ms without audio"
+
+
+def _scenario_av(config: AppConfig) -> str:
+    h = SimulationHarness(config)
+    # One held physical pair produces one activation despite repeat; a fresh
+    # pair is required for the second activation.
+    h.key_press(VK_F23, repeats=8)
+    assert len([w for w in h.workers if w.request.kind is WorkerKind.STRATAGEM]) == 1
+    h.key_press(VK_F23)
+    assert len([w for w in h.workers if w.request.kind is WorkerKind.STRATAGEM]) == 2
+
+    for active, certain in ((False, True), (False, False)):
+        gated = SimulationHarness(
+            config, foreground_active=active, foreground_certain=certain
+        )
+        assert gated.key_press(VK_F23) == (False, False)
+        assert not gated.workers and not gated.backend.events
+    generated = SimulationHarness(config)
+    assert not generated.policy.keyboard(
+        WM_KEYDOWN, VK_F24, 0x10, extra_info=0x43524F31
+    )
+    assert not generated.policy.keyboard(
+        WM_KEYUP, VK_F24, 0x10, extra_info=0x43524F31
+    )
+    assert not generated.workers
+    return "repeat collapsed, fresh press reran, and background/uncertain/owned triggers passed"
+
+
+def _scenario_aw(config: AppConfig) -> str:
+    firing = SimulationHarness(config)
+    firing.start(WeaponMode.PRIMARY)
+    before = list(firing.backend.events)
+    firing.key_press(VK_F23)
+    assert firing.backend.events == before
+    macro = firing.machine.worker
+    assert isinstance(macro, FakeSessionWorker)
+    macro.begin_macro_reload()
+    firing.drain()
+    before = list(firing.backend.events)
+    firing.key_press(VK_F24)
+    assert firing.backend.events == before
+
+    preparing = SimulationHarness(config, auto_complete_preparation=False)
+    preparing.key_press(VK_2)
+    before = list(preparing.backend.events)
+    preparing.key_press(VK_F23)
+    assert preparing.backend.events == before
+
+    bypass = SimulationHarness(config)
+    bypass.send(ControlEventKind.DEFERRED_BYPASS_DOWN)
+    bypass.drain()
+    before = list(bypass.backend.events)
+    bypass.key_press(VK_F24)
+    assert bypass.backend.events == before
+    return "firing, reload, preparation, and pending bypass rejected without deferred output"
+
+
+def _scenario_ax(config: AppConfig) -> str:
+    h = SimulationHarness(config, auto_complete_stratagem=False)
+    h.key_press(VK_F23)
+    worker = h.machine.worker
+    assert isinstance(worker, FakeSessionWorker)
+    h.backend.stratagem_key_down(worker.token, 0x1D, extended=False, ctrl=True)
+    h.backend.stratagem_key_down(worker.token, 0x48, extended=True)
+    h.key_press(VK_F24)
+    h.key_press(VK_1)
+    assert h.click() == (True, True)
+    assert h.machine.worker is worker and h.machine.selected_mode is WeaponMode.PRIMARY
+    assert h.policy.mouse(WM_RBUTTONDOWN, 0, 0) is False
+    h.policy.mouse(WM_RBUTTONUP, 0, 0)
+    h.drain()
+    assert h.backend.stratagem_owner is None and not h.machine.stratagem_active
+    assert h.audio.events == []
+
+    for shift in (VK_LSHIFT, VK_RSHIFT):
+        shifted = SimulationHarness(config, auto_complete_stratagem=False)
+        shifted.key_press(VK_F23)
+        active = shifted.machine.worker
+        assert isinstance(active, FakeSessionWorker)
+        shifted.backend.stratagem_mouse_down(active.token)
+        assert shifted.key_press(shift) == (True, True)
+        assert shifted.backend.stratagem_owner is None
+        assert not any(name == "R_DOWN" for name, _ in shifted.backend.events)
+    return "active exclusivity held; RMB and both Shifts canceled owned input without R/audio"
+
+
+def _scenario_ay(config: AppConfig) -> str:
+    for shutdown in (False, True):
+        h = SimulationHarness(config, auto_complete_stratagem=False)
+        h.key_press(VK_F23)
+        worker = h.machine.worker
+        assert isinstance(worker, FakeSessionWorker)
+        h.backend.stratagem_key_down(worker.token, 0x1D, extended=False, ctrl=True)
+        h.backend.stratagem_mouse_down(worker.token)
+        if shutdown:
+            h.machine.shutdown()
+        else:
+            h.foreground_loss(certain=False)
+        assert h.backend.stratagem_owner is None
+        assert not h.backend.stratagem_ctrl_owned
+        assert not h.backend.stratagem_mouse_owned
+    return "foreground uncertainty and shutdown cleaned only stratagem-owned inputs"
+
+
+def _scenario_az(config: AppConfig) -> str:
+    # Deterministically cancel inside every timing phase across all 21 arrow
+    # positions; every run must finish with no owned Ctrl/arrow/MB1.
+    for cutoff in [5, 25, 45, 65, 205, 225, 245, *(
+        25 + position * 40 for position in range(21)
+    )]:
+        h = SimulationHarness(config)
+        cancel = threading.Event()
+        origin = h.clock()
+
+        def wait(event: threading.Event, seconds: float) -> bool:
+            result = h.clock.wait(event, seconds)
+            if round((h.clock() - origin) * 1000) >= cutoff:
+                cancel.set()
+            return result
+
+        engine = MacroEngine(
+            h.config,
+            h.backend,
+            h.foreground.is_confirmed_active,
+            clock=h.clock,
+            wait=wait,
+        )
+        result = engine.run_stratagem(
+            900 + cutoff, FOUR_TARGET_SEQUENCES, cancel, threading.Event()
+        )
+        assert result.canceled
+        assert h.backend.stratagem_owner is None
+        assert not h.backend.stratagem_scan
+        assert not h.backend.stratagem_ctrl_owned
+        assert not h.backend.stratagem_mouse_owned
+    return "Ctrl settle, all arrow presses/gaps, MB1, and action-delay cancellation cleaned ownership"
+
+
 _SCENARIOS = (
     ("A", _scenario_a),
     ("B", _scenario_b),
@@ -2017,6 +2258,12 @@ _SCENARIOS = (
     ("AR", _scenario_ar),
     ("AS", _scenario_as),
     ("AT", _scenario_at),
+    ("AU", _scenario_au),
+    ("AV", _scenario_av),
+    ("AW", _scenario_aw),
+    ("AX", _scenario_ax),
+    ("AY", _scenario_ay),
+    ("AZ", _scenario_az),
 )
 
 

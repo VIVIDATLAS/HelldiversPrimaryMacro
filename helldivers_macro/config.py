@@ -54,6 +54,18 @@ class DiagnosticsConfig:
 
 
 @dataclass(frozen=True)
+class StratagemsConfig:
+    enabled: bool
+    four_target_trigger: str
+    support_trigger: str
+    key_press_ms: int
+    key_gap_ms: int
+    ctrl_settle_ms: int
+    action_press_ms: int
+    action_delay_ms: int
+
+
+@dataclass(frozen=True)
 class ToneConfig:
     frequency_hz: int
     duration_ms: int
@@ -97,6 +109,7 @@ class AppConfig:
     weapons: WeaponsConfig
     behavior: BehaviorConfig
     diagnostics: DiagnosticsConfig
+    stratagems: StratagemsConfig
     audio: AudioConfig
     primary: PrimaryConfig
     secondary: SecondaryConfig
@@ -178,6 +191,7 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
     weapons_t = _table(data, "weapons")
     behavior_t = _table(data, "behavior")
     diagnostics_t = _table(data, "diagnostics")
+    stratagems_t = _table(data, "stratagems")
     audio_t = _table(data, "audio")
     audio_on_t = _table(audio_t, "on")
     audio_off_t = _table(audio_t, "off")
@@ -245,6 +259,20 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
             diagnostics_t, "diagnostics", "state_tracing", bool
         ),
     )
+    stratagems = StratagemsConfig(
+        enabled=_value(stratagems_t, "stratagems", "enabled", bool),
+        four_target_trigger=_value(
+            stratagems_t, "stratagems", "four_target_trigger", str
+        ).upper(),
+        support_trigger=_value(
+            stratagems_t, "stratagems", "support_trigger", str
+        ).upper(),
+        key_press_ms=_value(stratagems_t, "stratagems", "key_press_ms", int),
+        key_gap_ms=_value(stratagems_t, "stratagems", "key_gap_ms", int),
+        ctrl_settle_ms=_value(stratagems_t, "stratagems", "ctrl_settle_ms", int),
+        action_press_ms=_value(stratagems_t, "stratagems", "action_press_ms", int),
+        action_delay_ms=_value(stratagems_t, "stratagems", "action_delay_ms", int),
+    )
     audio = AudioConfig(
         on=ToneConfig(
             frequency_hz=_value(audio_on_t, "audio.on", "frequency_hz", int),
@@ -264,6 +292,7 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         weapons,
         behavior,
         diagnostics,
+        stratagems,
         audio,
         primary,
         secondary,
@@ -324,6 +353,25 @@ def validate_config(config: AppConfig) -> None:
     _nonnegative("weapons.switch_settle_ms", config.weapons.switch_settle_ms)
     if config.behavior.start_policy != "immediate":
         raise ConfigError("behavior.start_policy supports only 'immediate'")
+
+    for name, trigger in (
+        ("four_target_trigger", config.stratagems.four_target_trigger),
+        ("support_trigger", config.stratagems.support_trigger),
+    ):
+        if trigger not in {"F23", "F24"}:
+            raise ConfigError(f"stratagems.{name} supports only 'F23' or 'F24'")
+    if config.stratagems.four_target_trigger == config.stratagems.support_trigger:
+        raise ConfigError("stratagem trigger keys must be distinct")
+    for name in (
+        "key_press_ms", "key_gap_ms", "ctrl_settle_ms", "action_press_ms"
+    ):
+        value = getattr(config.stratagems, name)
+        if not 1 <= value <= 10_000:
+            raise ConfigError(f"stratagems.{name} must be from 1 through 10000 ms")
+    if not 0 <= config.stratagems.action_delay_ms <= 60_000:
+        raise ConfigError(
+            "stratagems.action_delay_ms must be from 0 through 60000 ms"
+        )
 
     for name, tone in (("audio.on", config.audio.on), ("audio.off", config.audio.off)):
         if not 37 <= tone.frequency_hz <= 32767:

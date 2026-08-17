@@ -22,6 +22,7 @@ from .models import (
     WorkerRequest,
     WorkerResult,
 )
+from .stratagems import FOUR_TARGET_SEQUENCES, SUPPORT_SEQUENCES
 
 
 class AudioSignals(Protocol):
@@ -118,6 +119,7 @@ class MacroStateMachine:
         self._foreground_loss_latched = False
         self._trace_sequence = 0
         self._trace_started_at = self._clock()
+        self._stratagem_input_safety_latched = False
         self.fatal_error: BaseException | None = None
 
     @property
@@ -164,6 +166,10 @@ class MacroStateMachine:
             and self._worker is not None
             and self._worker.reload_in_progress()
         )
+
+    @property
+    def stratagem_active(self) -> bool:
+        return self._worker_kind is WorkerKind.STRATAGEM
 
     @property
     def armed(self) -> bool:
@@ -331,6 +337,10 @@ class MacroStateMachine:
             self._shift_down(event.detail, event.source)
         elif kind is ControlEventKind.SHIFT_UP:
             return
+        elif kind is ControlEventKind.STRATAGEM_FOUR:
+            self._start_stratagem(FOUR_TARGET_SEQUENCES, event.source)
+        elif kind is ControlEventKind.STRATAGEM_SUPPORT:
+            self._start_stratagem(SUPPORT_SEQUENCES, event.source)
         elif kind is ControlEventKind.FOREGROUND_ACTIVE:
             self._foreground_acquired(event.source)
         elif kind in (
@@ -355,6 +365,9 @@ class MacroStateMachine:
 
     def _select(self, mode: WeaponMode, source: EventSource) -> None:
         previous = self._snapshot()
+        if self.stratagem_active:
+            self._start_rejected("stratagem worker is active", source, previous)
+            return
         if self._foreground_active():
             self._foreground_acquired(source)
         if mode is self.selected_mode:
@@ -419,6 +432,9 @@ class MacroStateMachine:
             self._start_rejected("duplicate physical MB1-down", source, previous)
             return
         self._physical_mb1_down = True
+        if self.stratagem_active:
+            self._start_rejected("stratagem worker is active", source, previous)
+            return
         if self._neutral_rearm_required:
             self._start_rejected("neutral MB1 release required", source, previous)
             return
@@ -568,6 +584,9 @@ class MacroStateMachine:
         if source is not EventSource.PHYSICAL or not self._foreground_active():
             return
         self._foreground_acquired(source)
+        if self.stratagem_active:
+            self._generation += 1
+            self._request_stop("RMB stratagem cancellation")
         if (
             self._aim_state is AimState.UNKNOWN
             and self._shift_worker is not None
@@ -648,6 +667,47 @@ class MacroStateMachine:
                 self._off_pending = True
                 self._finish_off()
             self._start_rejected("macro worker could not start", source, previous)
+
+    def _start_stratagem(
+        self,
+        sequences: tuple[tuple[object, ...], ...],
+        source: EventSource,
+    ) -> None:
+        previous = self._snapshot()
+        busy = (
+            not self._config.stratagems.enabled
+            or not self._foreground_active()
+            or self._enabled
+            or self._worker is not None
+            or self._shift_worker is not None
+            or self._aim_off_worker is not None
+            or self._deferred_release is not None
+            or self._physical_mb1_down
+            or self._coordination.macro_active()
+            or self._coordination.firing_active()
+            or self._coordination.cleanup_pending()
+            or self._coordination.stratagem_active()
+            or self._stratagem_input_safety_latched
+        )
+        if busy:
+            self._start_rejected("controller is not disabled idle", source, previous)
+            return
+        self._generation += 1
+        request = WorkerRequest(
+            WorkerKind.STRATAGEM,
+            self.selected_mode,
+            generation=self._generation,
+            stratagem_sequences=sequences,
+        )
+        if not self._start_worker(request, MacroState.RUNNING_STRATAGEM):
+            self._start_rejected("stratagem worker could not start", source, previous)
+            return
+        self._trace(
+            "STRATAGEM_STARTED",
+            source=source,
+            previous=previous,
+            reason="accepted foreground physical trigger while disabled idle",
+        )
 
     def _cancel_preparation_for_immediate_start(
         self, source: EventSource
@@ -771,6 +831,8 @@ class MacroStateMachine:
         self._worker_phase = f"{request.kind.name}_STARTING"
         if request.kind is WorkerKind.MACRO:
             self._coordination.macro_started()
+        elif request.kind is WorkerKind.STRATAGEM:
+            self._coordination.stratagem_started()
         try:
             worker.start()
             if request.kind is WorkerKind.PREPARATION:
@@ -797,6 +859,8 @@ class MacroStateMachine:
                 # Publish cleanup completion only after the owned-input release
                 # attempt, preserving the deferred-bypass ordering contract.
                 self._coordination.cleanup_completed()
+            elif request.kind is WorkerKind.STRATAGEM:
+                self._coordination.stratagem_stopped()
             self._worker = None
             self._worker_kind = None
             self._worker_mode = None
@@ -813,6 +877,9 @@ class MacroStateMachine:
 
     def _manual_bypass(self, source: EventSource) -> None:
         previous = self._snapshot()
+        if self.stratagem_active:
+            self._start_rejected("stratagem worker is active", source, previous)
+            return
         self._physical_mb1_down = True
         self._magazines[self.selected_mode] = MagazineState.UNKNOWN
         self._set_preparation_lifecycle(
@@ -837,6 +904,9 @@ class MacroStateMachine:
 
     def _deferred_bypass_down(self, source: EventSource) -> None:
         previous = self._snapshot()
+        if self.stratagem_active:
+            self._start_rejected("stratagem worker is active", source, previous)
+            return
         self._physical_mb1_down = True
         self._magazines[self.selected_mode] = MagazineState.UNKNOWN
         self._set_preparation_lifecycle(
@@ -1076,6 +1146,9 @@ class MacroStateMachine:
             return
         if self._foreground_active():
             self._foreground_acquired(source)
+        if self.stratagem_active:
+            self._generation += 1
+            self._request_stop("Shift stratagem cancellation")
         self._trace(
             "SHIFT_DEFERRED",
             source=source,
@@ -1645,6 +1718,11 @@ class MacroStateMachine:
                 error=RuntimeError(f"invalid worker result {event.detail!r}"),
             )
         )
+        if result.error is not None:
+            # A failed generated-output or cleanup boundary is not proof that
+            # every older owned input is up. Conservatively prevent a later
+            # stratagem from overlapping that uncertain ownership.
+            self._stratagem_input_safety_latched = True
         kind = self._worker_kind
         mode = self._worker_mode
         request = self._worker.request
@@ -1662,6 +1740,8 @@ class MacroStateMachine:
         if kind is WorkerKind.MACRO:
             self._coordination.firing_stopped()
             self._coordination.cleanup_completed()
+        elif kind is WorkerKind.STRATAGEM:
+            self._coordination.stratagem_stopped()
 
         if kind is WorkerKind.PREPARATION:
             preparation_succeeded = (
@@ -1813,6 +1893,19 @@ class MacroStateMachine:
                 reason="tagged bypass pair completed",
             )
 
+        elif kind is WorkerKind.STRATAGEM:
+            self._set_state(self._idle_state())
+            self._trace(
+                "STRATAGEM_COMPLETED" if result.success else "STRATAGEM_STOPPED",
+                source=EventSource.WORKER,
+                previous=previous,
+                reason=(
+                    f"input/foreground error: {result.error}"
+                    if result.error is not None
+                    else cancellation_reason or "sequence completed"
+                ),
+            )
+
         if self._off_pending:
             self._finish_off()
 
@@ -1932,6 +2025,7 @@ class MacroStateMachine:
             retired_aim_off.join(2.0)
         self._retired_aim_off_workers.clear()
         self._coordination.cleanup_completed()
+        self._coordination.stratagem_stopped()
         self._finish_off()
         self._trace(
             "SHUTDOWN",

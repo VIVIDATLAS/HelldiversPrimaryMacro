@@ -52,6 +52,8 @@ VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
 VK_RCONTROL = 0xA3
 VK_P = 0x50
+VK_F23 = 0x86
+VK_F24 = 0x87
 SHIFT_SCAN_CODES = {VK_LSHIFT: 0x2A, VK_RSHIFT: 0x36}
 
 LRESULT = ctypes.c_ssize_t
@@ -107,6 +109,7 @@ class HookPolicy:
         cadence_diagnostics: CadenceDiagnostics | None = None,
         fire_device: str = "mouse",
         fire_scan_code: int | None = None,
+        stratagem_triggers: dict[int, ControlEventKind] | None = None,
     ) -> None:
         self._foreground_status = foreground_status
         self._event_sink = event_sink
@@ -116,11 +119,13 @@ class HookPolicy:
         self._cadence_diagnostics = cadence_diagnostics
         self._fire_device = fire_device
         self._fire_scan_code = fire_scan_code
+        self._stratagem_triggers = stratagem_triggers or {}
         self._keys_down: set[int] = set()
         self._left_pair_decision: Mb1PairDecision | None = None
         self._left_pair_is_manual = False
         self._right_pair_decision: Mb2PairDecision | None = None
         self._deferred_shift_pairs: set[int] = set()
+        self._stratagem_pairs: dict[int, bool] = {}
 
     @property
     def ctrl_down(self) -> bool:
@@ -199,8 +204,17 @@ class HookPolicy:
             return False
         if message in (WM_KEYDOWN, WM_SYSKEYDOWN):
             if vk_code in self._keys_down:
+                if vk_code in self._stratagem_pairs:
+                    return self._stratagem_pairs[vk_code]
                 return vk_code in self._deferred_shift_pairs
             self._keys_down.add(vk_code)
+            if vk_code in self._stratagem_triggers:
+                active, certain = self._foreground_status()
+                suppress = active and certain
+                self._stratagem_pairs[vk_code] = suppress
+                if suppress and not self._coordination.stratagem_active():
+                    self._emit(self._stratagem_triggers[vk_code])
+                return suppress
             if vk_code in (VK_LCONTROL, VK_RCONTROL):
                 # Publish physical Ctrl and the cancellation gate before any
                 # queued controller work or later mouse callback can run.
@@ -228,7 +242,7 @@ class HookPolicy:
                     return True
             elif vk_code in (VK_1, VK_2):
                 active, certain = self._foreground_status()
-                if active:
+                if active and not self._coordination.stratagem_active():
                     self._emit(
                         ControlEventKind.SELECT_PRIMARY
                         if vk_code == VK_1
@@ -242,6 +256,8 @@ class HookPolicy:
         elif message in (WM_KEYUP, WM_SYSKEYUP):
             was_down = vk_code in self._keys_down
             self._keys_down.discard(vk_code)
+            if vk_code in self._stratagem_pairs:
+                return self._stratagem_pairs.pop(vk_code)
             if was_down and vk_code in (VK_LCONTROL, VK_RCONTROL):
                 self._emit(ControlEventKind.CTRL_UP)
             elif vk_code in (VK_LSHIFT, VK_RSHIFT):
@@ -316,6 +332,8 @@ class HookPolicy:
             self._left_pair_is_manual = False
             if not active:
                 decision = Mb1PairDecision.PASS_THROUGH
+            elif self._coordination.stratagem_active():
+                decision = Mb1PairDecision.SUPPRESS_STRATAGEM_BUSY
             elif not self.ctrl_down:
                 decision = Mb1PairDecision.SUPPRESS_TOGGLE
             else:
@@ -352,6 +370,8 @@ class HookPolicy:
             self._left_pair_is_manual = False
             if decision is Mb1PairDecision.SUPPRESS_TOGGLE:
                 self._emit(ControlEventKind.PHYSICAL_MB1_UP)
+                return True
+            if decision is Mb1PairDecision.SUPPRESS_STRATAGEM_BUSY:
                 return True
             if decision is Mb1PairDecision.DEFERRED_BYPASS:
                 self._emit(ControlEventKind.DEFERRED_BYPASS_UP)
@@ -560,6 +580,8 @@ class WindowsHookThread:
                 VK_RSHIFT,
                 VK_1,
                 VK_2,
+                VK_F23,
+                VK_F24,
             ):
                 self._policy.initialize_physical_key(
                     vk_code, bool(self._user32.GetAsyncKeyState(vk_code) & 0x8000)

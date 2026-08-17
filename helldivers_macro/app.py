@@ -14,7 +14,7 @@ from .cadence_diagnostics import CadenceDiagnostics
 from .config import AppConfig, ConfigError, load_config
 from .foreground import ForegroundCache, ForegroundMonitor, WindowsForegroundInspector
 from .input_backend import INPUT_MARKER, InputCoordination, SendInputBackend
-from .input_hooks import HookPolicy, WindowsHookThread
+from .input_hooks import HookPolicy, VK_F23, VK_F24, WindowsHookThread
 from .macro_engine import (
     MacroEngine,
     MacroWorker,
@@ -32,6 +32,11 @@ from .models import (
     WorkerResult,
 )
 from .state_machine import MacroStateMachine
+from .stratagems import (
+    FOUR_TARGET_SEQUENCES,
+    LEFT_CTRL_SCAN_CODE,
+    SUPPORT_SEQUENCES,
+)
 from .timer_resolution import TimerResolutionError, WindowsTimerResolution
 
 
@@ -210,6 +215,16 @@ def _run_live_session(
         cadence_diagnostics=diagnostics,
         fire_device=config.output.fire_device,
         fire_scan_code=config.output.fire_scan_code,
+        stratagem_triggers=(
+            {
+                (VK_F23 if config.stratagems.four_target_trigger == "F23" else VK_F24):
+                    ControlEventKind.STRATAGEM_FOUR,
+                (VK_F23 if config.stratagems.support_trigger == "F23" else VK_F24):
+                    ControlEventKind.STRATAGEM_SUPPORT,
+            }
+            if config.stratagems.enabled
+            else {}
+        ),
     )
     hooks = WindowsHookThread(policy, event_queue.put_nowait)
     audio_started = False
@@ -308,6 +323,50 @@ def _format_dry_run(
     return "\n".join(lines)
 
 
+def _format_stratagem_dry_run(
+    name: str, sequences: tuple[tuple[object, ...], ...], config: AppConfig
+) -> str:
+    lines = [f"{name} dry-run (no hooks, input, suppression, or audio):"]
+    elapsed = 0
+    operation = 0
+
+    def event(label: str) -> None:
+        nonlocal operation
+        operation += 1
+        lines.append(f"{operation:02d}. {label} (elapsed {elapsed} ms)")
+
+    def wait(label: str, duration_ms: int) -> None:
+        nonlocal operation, elapsed
+        operation += 1
+        elapsed += duration_ms
+        lines.append(
+            f"{operation:02d}. WAIT {label} {duration_ms} ms (elapsed {elapsed} ms)"
+        )
+
+    timing = config.stratagems
+    for entry, sequence in enumerate(sequences, start=1):
+        event(f"CTRL_DOWN scan=0x{LEFT_CTRL_SCAN_CODE:02X} SCANCODE")
+        wait("CTRL_SETTLE", timing.ctrl_settle_ms)
+        for direction in sequence:
+            event(
+                f"{direction.name}_DOWN scan=0x{direction.scan_code:02X} "
+                "SCANCODE|EXTENDEDKEY"
+            )
+            wait("KEY_PRESS", timing.key_press_ms)
+            event(
+                f"{direction.name}_UP scan=0x{direction.scan_code:02X} "
+                "SCANCODE|EXTENDEDKEY|KEYUP"
+            )
+            wait("KEY_GAP", timing.key_gap_ms)
+        event(f"CTRL_UP scan=0x{LEFT_CTRL_SCAN_CODE:02X} SCANCODE|KEYUP")
+        event("MB1_DOWN tagged")
+        wait("ACTION_PRESS", timing.action_press_ms)
+        event("MB1_UP tagged")
+        wait(f"ACTION_DELAY entry={entry}", timing.action_delay_ms)
+    lines.append(f"Total duration: {elapsed} ms")
+    return "\n".join(lines)
+
+
 def test_audio(config: AppConfig) -> int:
     ensure_windows_11_pro()
     notifier = AudioNotifier(config.audio)
@@ -342,6 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--identify-foreground", action="store_true")
     modes.add_argument("--dry-run-primary-cycle", action="store_true")
     modes.add_argument("--dry-run-secondary-cycle", action="store_true")
+    modes.add_argument("--dry-run-stratagem-four", action="store_true")
+    modes.add_argument("--dry-run-stratagem-support", action="store_true")
     modes.add_argument("--simulate-session", action="store_true")
     modes.add_argument("--test-audio", action="store_true")
     modes.add_argument("--live", action="store_true")
@@ -370,6 +431,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.identify_foreground,
             args.dry_run_primary_cycle,
             args.dry_run_secondary_cycle,
+            args.dry_run_stratagem_four,
+            args.dry_run_stratagem_support,
             args.simulate_session,
             args.test_audio,
             args.live,
@@ -402,6 +465,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     fire_device=config.output.fire_device,
                 )
             )
+            return 0
+        if args.dry_run_stratagem_four:
+            print(_format_stratagem_dry_run(
+                "FOUR-TARGET", FOUR_TARGET_SEQUENCES, config
+            ))
+            return 0
+        if args.dry_run_stratagem_support:
+            print(_format_stratagem_dry_run(
+                "RESUPPLY + REINFORCE", SUPPORT_SEQUENCES, config
+            ))
             return 0
         if args.simulate_session:
             return simulate_session(config)

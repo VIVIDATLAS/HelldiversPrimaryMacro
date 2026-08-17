@@ -28,6 +28,16 @@ start_policy = "immediate"
 ctrl_bypass_logging = false
 state_tracing = false
 
+[stratagems]
+enabled = true
+four_target_trigger = "f23"
+support_trigger = "f24"
+key_press_ms = 20
+key_gap_ms = 20
+ctrl_settle_ms = 20
+action_press_ms = 20
+action_delay_ms = 800
+
 [audio.on]
 frequency_hz = 1000
 duration_ms = 100

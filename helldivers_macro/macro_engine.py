@@ -18,6 +18,7 @@ from .models import (
     WorkerRequest,
     WorkerResult,
 )
+from .stratagems import Direction, LEFT_CTRL_SCAN_CODE
 
 
 CONTROL_REPLAY_PRESS_MS = 20
@@ -40,6 +41,15 @@ class GeneratedInput(Protocol):
     def reload_up(self) -> None: ...
     def release_shift_inputs(self) -> None: ...
     def release_all(self) -> None: ...
+    def stratagem_key_down(
+        self, token: int, scan_code: int, *, extended: bool, ctrl: bool = False
+    ) -> None: ...
+    def stratagem_key_up(
+        self, token: int, scan_code: int, *, extended: bool, ctrl: bool = False
+    ) -> None: ...
+    def stratagem_mouse_down(self, token: int) -> None: ...
+    def stratagem_mouse_up(self, token: int) -> None: ...
+    def release_stratagem(self, token: int) -> None: ...
 
 
 def primary_cycle_steps(config: AppConfig) -> list[CycleStep]:
@@ -634,6 +644,81 @@ class MacroEngine:
             release_owned=self.backend.release_all,
         )
 
+    def run_stratagem(
+        self,
+        token: int,
+        sequences: tuple[tuple[Direction, ...], ...],
+        cancel_event: threading.Event,
+        shutdown_event: threading.Event,
+    ) -> WorkerResult:
+        error: BaseException | None = None
+        canceled = False
+        success = False
+        timing = self._config.stratagems
+
+        def output(action: Callable[[], None]) -> None:
+            with self.io_lock:
+                self._check_active(cancel_event, shutdown_event)
+                action()
+
+        try:
+            for sequence in sequences:
+                output(
+                    lambda: self.backend.stratagem_key_down(
+                        token, LEFT_CTRL_SCAN_CODE, extended=False, ctrl=True
+                    )
+                )
+                self._cancelable_wait(
+                    timing.ctrl_settle_ms, cancel_event, shutdown_event
+                )
+                for direction in sequence:
+                    output(
+                        lambda direction=direction: self.backend.stratagem_key_down(
+                            token,
+                            direction.scan_code,
+                            extended=True,
+                        )
+                    )
+                    self._cancelable_wait(
+                        timing.key_press_ms, cancel_event, shutdown_event
+                    )
+                    output(
+                        lambda direction=direction: self.backend.stratagem_key_up(
+                            token,
+                            direction.scan_code,
+                            extended=True,
+                        )
+                    )
+                    self._cancelable_wait(
+                        timing.key_gap_ms, cancel_event, shutdown_event
+                    )
+                output(
+                    lambda: self.backend.stratagem_key_up(
+                        token, LEFT_CTRL_SCAN_CODE, extended=False, ctrl=True
+                    )
+                )
+                output(lambda: self.backend.stratagem_mouse_down(token))
+                self._cancelable_wait(
+                    timing.action_press_ms, cancel_event, shutdown_event
+                )
+                output(lambda: self.backend.stratagem_mouse_up(token))
+                self._cancelable_wait(
+                    timing.action_delay_ms, cancel_event, shutdown_event
+                )
+            success = True
+        except InterruptedError:
+            canceled = True
+        except (ForegroundLost, InputApiError) as exc:
+            error = exc
+        except BaseException as exc:
+            error = exc
+        return self._finish_result(
+            success=success,
+            canceled=canceled,
+            error=error,
+            release_owned=lambda: self.backend.release_stratagem(token),
+        )
+
 
 class MacroWorker:
     def __init__(
@@ -693,6 +778,8 @@ class MacroWorker:
                     self._engine.backend.release_shift_inputs()
                 elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
                     self._engine.backend.release_shift_inputs()
+                elif self.request.kind is WorkerKind.STRATAGEM:
+                    self._engine.backend.release_stratagem(self.token)
                 else:
                     context = (
                         self._engine._cadence_diagnostics.macro_cleanup_scope(
@@ -832,6 +919,13 @@ class MacroWorker:
             result = self._engine.forward_bypass(
                 self.request.bypass_release,
                 self.request.bypass_click_ms,
+                self.cancel_event,
+                self._shutdown,
+            )
+        elif self.request.kind is WorkerKind.STRATAGEM:
+            result = self._engine.run_stratagem(
+                self.token,
+                self.request.stratagem_sequences,
                 self.cancel_event,
                 self._shutdown,
             )

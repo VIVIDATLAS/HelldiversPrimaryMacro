@@ -25,6 +25,7 @@ MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_SCANCODE = 0x0008
 MAPVK_VK_TO_VSC = 0
 VK_R = 0x52
@@ -79,6 +80,7 @@ class InputCoordination:
         self._macro_active = threading.Event()
         self._firing_active = threading.Event()
         self._cleanup_pending = threading.Event()
+        self._stratagem_active = threading.Event()
 
     def macro_started(self) -> None:
         self._macro_active.set()
@@ -111,6 +113,15 @@ class InputCoordination:
 
     def macro_active(self) -> bool:
         return self._macro_active.is_set()
+
+    def stratagem_started(self) -> None:
+        self._stratagem_active.set()
+
+    def stratagem_stopped(self) -> None:
+        self._stratagem_active.clear()
+
+    def stratagem_active(self) -> bool:
+        return self._stratagem_active.is_set()
 
 
 def validate_ctypes_layouts() -> None:
@@ -173,6 +184,10 @@ class SendInputBackend:
         self._shift_owned = False
         self._shift_scan = 0
         self._reload_owned = False
+        self._stratagem_owner: int | None = None
+        self._stratagem_scan: tuple[int, bool] | None = None
+        self._stratagem_ctrl_owned = False
+        self._stratagem_mouse_owned = False
 
     @property
     def mouse_owned(self) -> bool:
@@ -249,11 +264,115 @@ class SendInputBackend:
         return value
 
     @staticmethod
-    def _keyboard_input(scan_code: int, *, key_up: bool) -> INPUT:
-        flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if key_up else 0)
+    def _keyboard_input(
+        scan_code: int, *, key_up: bool, extended: bool = False
+    ) -> INPUT:
+        flags = (
+            KEYEVENTF_SCANCODE
+            | (KEYEVENTF_EXTENDEDKEY if extended else 0)
+            | (KEYEVENTF_KEYUP if key_up else 0)
+        )
         value = INPUT(type=INPUT_KEYBOARD)
         value.ki = KEYBDINPUT(0, scan_code, flags, 0, INPUT_MARKER)
         return value
+
+    def _claim_stratagem(self, token: int) -> None:
+        if self._stratagem_owner not in (None, token):
+            raise InputApiError("stratagem output is owned by another worker")
+        self._stratagem_owner = token
+
+    def stratagem_key_down(
+        self, token: int, scan_code: int, *, extended: bool, ctrl: bool = False
+    ) -> None:
+        with self._lock:
+            self._claim_stratagem(token)
+            if ctrl:
+                if self._stratagem_ctrl_owned:
+                    raise InputApiError("refusing duplicate stratagem Ctrl down")
+            elif self._stratagem_scan is not None:
+                raise InputApiError("refusing overlapping stratagem arrow down")
+            self._send_exactly_one(
+                self._keyboard_input(scan_code, key_up=False, extended=extended),
+                "stratagem Ctrl down" if ctrl else "stratagem arrow down",
+            )
+            if ctrl:
+                self._stratagem_ctrl_owned = True
+            else:
+                self._stratagem_scan = (scan_code, extended)
+
+    def stratagem_key_up(
+        self, token: int, scan_code: int, *, extended: bool, ctrl: bool = False
+    ) -> None:
+        with self._lock:
+            if self._stratagem_owner != token:
+                return
+            if ctrl:
+                if not self._stratagem_ctrl_owned:
+                    return
+            elif self._stratagem_scan != (scan_code, extended):
+                return
+            self._send_exactly_one(
+                self._keyboard_input(scan_code, key_up=True, extended=extended),
+                "stratagem Ctrl up" if ctrl else "stratagem arrow up",
+            )
+            if ctrl:
+                self._stratagem_ctrl_owned = False
+            else:
+                self._stratagem_scan = None
+
+    def stratagem_mouse_down(self, token: int) -> None:
+        with self._lock:
+            self._claim_stratagem(token)
+            if self._stratagem_mouse_owned:
+                raise InputApiError("refusing duplicate stratagem MB1 down")
+            self._send_exactly_one(
+                self._mouse_input(MOUSEEVENTF_LEFTDOWN), "stratagem MB1 down"
+            )
+            self._stratagem_mouse_owned = True
+
+    def stratagem_mouse_up(self, token: int) -> None:
+        with self._lock:
+            if self._stratagem_owner != token or not self._stratagem_mouse_owned:
+                return
+            self._send_exactly_one(
+                self._mouse_input(MOUSEEVENTF_LEFTUP), "stratagem MB1 up"
+            )
+            self._stratagem_mouse_owned = False
+
+    def release_stratagem(self, token: int) -> None:
+        """Release only inputs held by the matching stratagem generation."""
+        errors: list[str] = []
+        with self._lock:
+            if self._stratagem_owner != token:
+                return
+            if self._stratagem_scan is not None:
+                scan_code, extended = self._stratagem_scan
+                try:
+                    self.stratagem_key_up(
+                        token, scan_code, extended=extended, ctrl=False
+                    )
+                except InputApiError as exc:
+                    errors.append(str(exc))
+            if self._stratagem_ctrl_owned:
+                try:
+                    self.stratagem_key_up(
+                        token, 0x1D, extended=False, ctrl=True
+                    )
+                except InputApiError as exc:
+                    errors.append(str(exc))
+            if self._stratagem_mouse_owned:
+                try:
+                    self.stratagem_mouse_up(token)
+                except InputApiError as exc:
+                    errors.append(str(exc))
+            if not (
+                self._stratagem_scan
+                or self._stratagem_ctrl_owned
+                or self._stratagem_mouse_owned
+            ):
+                self._stratagem_owner = None
+        if errors:
+            raise InputApiError("; ".join(errors))
 
     def mouse_down(self) -> None:
         with self._lock:
@@ -373,6 +492,11 @@ class SendInputBackend:
     def release_all(self) -> None:
         errors: list[str] = []
         with self._lock:
+            if self._stratagem_owner is not None:
+                try:
+                    self.release_stratagem(self._stratagem_owner)
+                except InputApiError as exc:
+                    errors.append(str(exc))
             if self._fire_key_owned:
                 try:
                     if self._cadence_diagnostics is None:

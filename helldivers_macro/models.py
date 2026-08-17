@@ -31,6 +31,7 @@ class PreparationLifecycle(Enum):
 
 class Mb1PairDecision(Enum):
     SUPPRESS_TOGGLE = auto()
+    SUPPRESS_STRATAGEM_BUSY = auto()
     PASS_THROUGH = auto()
     DEFERRED_BYPASS = auto()
 
@@ -47,6 +48,7 @@ class WorkerKind(Enum):
     SHIFT_TRANSACTION = auto()
     AIM_OFF_TRANSACTION = auto()
     BYPASS = auto()
+    STRATAGEM = auto()
 
 
 class WorkerProgress(Enum):
@@ -85,6 +87,7 @@ class MacroState(Enum):
     RELOADING_PRIMARY = auto()
     RELOADING_SECONDARY = auto()
     FORWARDING_BYPASS = auto()
+    RUNNING_STRATAGEM = auto()
     STOPPING = auto()
     SHUTTING_DOWN = auto()
 
@@ -104,6 +107,8 @@ class ControlEventKind(Enum):
     CTRL_UP = auto()
     SHIFT_DOWN = auto()
     SHIFT_UP = auto()
+    STRATAGEM_FOUR = auto()
+    STRATAGEM_SUPPORT = auto()
     FOREGROUND_ACTIVE = auto()
     FOREGROUND_LOST = auto()
     FOREGROUND_UNCERTAIN = auto()
@@ -151,6 +156,7 @@ class WorkerRequest:
     cancel_aim: bool = False
     native_aim_cancel: bool = False
     normalize_unknown_aim: bool = False
+    stratagem_sequences: tuple[tuple[Any, ...], ...] = ()
 
 
 @dataclass(frozen=True)

@@ -21,11 +21,57 @@ anti-cheat, or elevated-mode bypass.
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
 6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through AT with fake hooks, input, foreground, time, workers,
+   scenarios A through AZ with fake hooks, input, foreground, time, workers,
    and audio only.
-7. Review both dry runs before deliberately choosing `--live`.
+7. Review the weapon and stratagem dry runs before deliberately choosing `--live`.
 
 Running `python main.py` without a mode prints help and does nothing.
+
+## Stratagem macros (F23/F24)
+
+The two foreground-only standard Windows trigger keys are:
+
+- F23: four-target stratagem macro
+- F24: Resupply followed by Reinforce
+
+Required Helldivers controls are Left Ctrl for opening/holding the stratagem
+menu, arrow keys for directions, and MB1 for throw/activate. PRIMARY weapon
+mode remains Automatic. Do not bind Fire to P for this setup.
+
+The exact F23 entries are `DOWN UP RIGHT RIGHT UP`, `DOWN UP RIGHT UP LEFT UP`,
+`DOWN UP RIGHT RIGHT LEFT`, and `DOWN UP RIGHT DOWN LEFT`. F24 enters Resupply
+as `DOWN DOWN UP RIGHT`, then Reinforce as `UP DOWN RIGHT LEFT UP`. Each entry
+holds generated Left Ctrl, uses tagged extended scan-code arrows, releases
+Ctrl, sends one separately owned tagged MB1 click, and retains the final 800 ms
+delay. Safe fake durations are 4,200 ms for F23 and 2,040 ms for F24.
+
+G1/G2 may be remapped externally to the ordinary F23/F24 keys. Python listens
+only for those standard Windows key events and has no runtime dependency on G
+Hub or Lua. Triggers work only while `helldivers2.exe` is the certain foreground
+target and weapon firing is disabled with no reload, preparation, bypass,
+aim-off, or Shift transaction active. Busy presses are consumed, rejected, and
+never queued for later.
+
+One physical trigger pair is latched and suppressed; auto-repeat does not
+retrigger, and a release plus new press is required. During a sequence MB1 and
+weapon-selection controller actions are blocked. RMB, either Shift key,
+foreground loss/uncertainty, shutdown, Ctrl+C, hook/backend failure, or an
+input failure cancels the sequence and releases only that worker's token-owned
+Ctrl, arrow, and action MB1. Shift still replays the existing sprint action;
+RMB still follows the existing physical aim-toggle handling. Stratagems never
+generate R, P, MB2 solely for cancellation, or weapon ON/OFF audio.
+
+```toml
+[stratagems]
+enabled = true
+four_target_trigger = "f23"
+support_trigger = "f24"
+key_press_ms = 20
+key_gap_ms = 20
+ctrl_settle_ms = 20
+action_press_ms = 20
+action_delay_ms = 800
+```
 
 ## Primary automatic-hold profile and calibration
 
@@ -150,6 +196,7 @@ but causes no controller transition. A 30 ms start debounce follows a stop.
 Every genuine physical MB1-down latches exactly one decision:
 
 - `SUPPRESS_TOGGLE`
+- `SUPPRESS_STRATAGEM_BUSY`
 - `PASS_THROUGH`
 - `DEFERRED_BYPASS`
 
@@ -473,6 +520,8 @@ python main.py --check-config
 python main.py --identify-foreground --delay 5
 python main.py --dry-run-primary-cycle
 python main.py --dry-run-secondary-cycle
+python main.py --dry-run-stratagem-four
+python main.py --dry-run-stratagem-support
 python main.py --simulate-session
 python main.py --test-audio
 python main.py --live
@@ -484,7 +533,7 @@ or firing-RMB, or generates input. `--test-audio` plays only the configured
 tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through AT and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+A through AZ and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
 the existing controller regressions plus aimed immediate UNKNOWN-ammunition start, switch-settle
 preemption, active-reload preemption, immediate stop, and first-cycle reload
 synchronization all pass. Scenario V verifies zero-gap SECONDARY reload;
@@ -497,6 +546,10 @@ for both weapons, persistent-sprint RMB/Shift paths, foreground cancellation,
 and preservation of an already-started reload without duplicate `R`. Scenario
 AT reproduces PowerShell-at-launch, first Helldivers acquisition, physical RMB,
 and MB1 reaching `MACRO_ENABLED` and `FIRING_STARTED`.
+Scenarios AU through AZ verify the exact F23/F24 sequences and durations,
+repeat/pair gating, background/uncertain/owned-event filtering, all busy-state
+rejections, active input exclusion, RMB/Shift/foreground/shutdown cleanup, and
+cancellation throughout every sequence timing phase and arrow position.
 
 The complete non-live validation set is:
 
@@ -506,6 +559,8 @@ python -m unittest discover -s tests -v
 python main.py --check-config
 python main.py --dry-run-primary-cycle
 python main.py --dry-run-secondary-cycle
+python main.py --dry-run-stratagem-four
+python main.py --dry-run-stratagem-support
 python main.py --simulate-session
 git diff --check
 git status --short
@@ -513,9 +568,10 @@ git status --short
 
 ## Platform limitations
 
-Logitech G815 G-keys are excluded because they are vendor-specific rather than
-standard number-row events. No Logitech G HUB, Lua, AutoHotkey, driver, helper
-executable, or third-party Python package is used.
+Logitech G-keys are vendor-specific, so this project does not read them
+directly. They may be mapped externally to standard F23/F24 events; the Python
+runtime does not use Logitech G HUB, Lua, AutoHotkey, a driver, a helper
+executable, or a third-party Python package.
 
 Windows can remove a low-level hook if a callback stalls; callbacks here only
 update small physical state, latch a decision, and enqueue work. Hook/message

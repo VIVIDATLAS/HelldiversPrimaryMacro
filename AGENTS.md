@@ -13,6 +13,12 @@ deferred-bypass, deferred RMB-off, and Shift transitions. Audio notifications
 have their own queue/thread.
 `simulation.py` provides deterministic end-to-end sessions using only fake OS
 boundaries, input, clock/waiting, workers, and audio.
+F23 runs the four-target stratagem macro and F24 runs Resupply followed by
+Reinforce. Both are certain-foreground, disabled-idle-only controller workers
+using tagged Left Ctrl, extended arrow scan codes, and a separately token-owned
+MB1 action click. RMB, Shift, foreground loss/uncertainty, shutdown, and input
+failure cancel and release only stratagem-owned input. G-keys may be externally
+mapped to ordinary F23/F24; Python has no G Hub or Lua runtime dependency.
 `cadence_diagnostics.py` provides bounded opt-in one-cycle PRIMARY correlation
 across the worker, `SendInput`, and hooks. In automatic mode it freezes after
 one configured MB1 hold pair and the first R pair, measures backend dispatch
@@ -81,6 +87,8 @@ python -m unittest discover -s tests -v
 python main.py --check-config
 python main.py --dry-run-primary-cycle
 python main.py --dry-run-secondary-cycle
+python main.py --dry-run-stratagem-four
+python main.py --dry-run-stratagem-support
 python main.py --simulate-session
 git diff --check
 git status --short
@@ -103,6 +111,6 @@ Ctrl cannot restart canceled work; foreground regain requires neutral physical
 input and never auto-restarts; foreground physical Shift is deferred once per pair, disables
 active firing once, conditionally exits aim before same-scan Shift replay,
 preserves an existing reload, never initiates `R`, and never restarts firing;
-scenarios A-AT and all authorized validation commands pass.
+scenarios A-AZ and all authorized validation commands pass.
 Ctrl-bypass and state-trace diagnostics default off and never log unrelated
 input; trace reasons are transition-local and include elapsed milliseconds.
