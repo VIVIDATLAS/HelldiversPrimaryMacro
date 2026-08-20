@@ -15,15 +15,17 @@ anti-cheat, or elevated-mode bypass.
 
 1. Install 64-bit Python 3.11 or newer on Windows 11 Pro.
 2. Open PowerShell in this directory. No packages need installation.
-3. Review `config.toml`. The default target is `helldivers2.exe`.
-4. Run `python main.py --check-config`.
-5. Start the game yourself, make it foreground, and run
+3. Set Helldivers' Aim behavior to **Hold**. Toggle aim is not supported.
+4. Review `config.toml`. The default target is `helldivers2.exe`, and
+   `controls.aim_mode` must be `"hold"`.
+5. Run `python main.py --check-config`.
+6. Start the game yourself, make it foreground, and run
    `python main.py --identify-foreground --delay 5` to inspect the owning
    process without hooks, input, suppression, or sound.
-6. Run `python main.py --simulate-session`. This exercises deterministic
-   scenarios A through AZ with fake hooks, input, foreground, time, workers,
+7. Run `python main.py --simulate-session`. This exercises deterministic
+   scenarios A through BA with fake hooks, input, foreground, time, workers,
    and audio only.
-7. Review the weapon and stratagem dry runs before deliberately choosing `--live`.
+8. Review the weapon and stratagem dry runs before deliberately choosing `--live`.
 
 Running `python main.py` without a mode prints help and does nothing.
 
@@ -38,18 +40,18 @@ Required Helldivers controls are Left Ctrl for opening/holding the stratagem
 menu, arrow keys for directions, and MB1 for throw/activate. PRIMARY weapon
 mode remains Automatic. Do not bind Fire to P for this setup.
 
-The exact F23 entries are `DOWN UP RIGHT RIGHT UP`, `DOWN UP RIGHT UP LEFT UP`,
-`DOWN UP RIGHT RIGHT LEFT`, and `DOWN UP RIGHT DOWN LEFT`. F24 enters Resupply
+The exact F23 entries are `DOWN UP RIGHT RIGHT UP`, `DOWN UP RIGHT LEFT`,
+`DOWN UP RIGHT UP LEFT UP`, and `DOWN UP RIGHT RIGHT LEFT`. F24 enters Resupply
 as `DOWN DOWN UP RIGHT`, then Reinforce as `UP DOWN RIGHT LEFT UP`. Each entry
 holds generated Left Ctrl, uses tagged extended scan-code arrows, releases
 Ctrl, sends one separately owned tagged MB1 click, and retains the final 800 ms
-delay. Safe fake durations are 4,200 ms for F23 and 2,040 ms for F24.
+delay. Safe fake durations are 4,160 ms for F23 and 2,040 ms for F24.
 
 G1/G2 may be remapped externally to the ordinary F23/F24 keys. Python listens
 only for those standard Windows key events and has no runtime dependency on G
 Hub or Lua. Triggers work only while `helldivers2.exe` is the certain foreground
-target and weapon firing is disabled with no reload, preparation, bypass,
-aim-off, or Shift transaction active. Busy presses are consumed, rejected, and
+target and weapon firing is disabled with no reload, preparation, bypass, or
+Shift transaction active. Busy presses are consumed, rejected, and
 never queued for later.
 
 One physical trigger pair is latched and suppressed; auto-repeat does not
@@ -57,9 +59,10 @@ retrigger, and a release plus new press is required. During a sequence MB1 and
 weapon-selection controller actions are blocked. RMB, either Shift key,
 foreground loss/uncertainty, shutdown, Ctrl+C, hook/backend failure, or an
 input failure cancels the sequence and releases only that worker's token-owned
-Ctrl, arrow, and action MB1. Shift still replays the existing sprint action;
-RMB still follows the existing physical aim-toggle handling. Stratagems never
-generate R, P, MB2 solely for cancellation, or weapon ON/OFF audio.
+Ctrl, arrow, and action MB1. Shift still replays the existing sprint action. A
+physical RMB-down can cancel an active stratagem, but that busy press is not
+delayed into weapon activation and must be released before a fresh foreground
+RMB-down can arm firing. Stratagems never generate R, P, or weapon ON/OFF audio.
 
 ```toml
 [stratagems]
@@ -76,7 +79,7 @@ action_delay_ms = 800
 ## Primary automatic-hold profile and calibration
 
 Configure the AR-2 to **Automatic** in Helldivers and keep Fire bound to MB1.
-Physical MB1 remains the macro ON/OFF toggle. Once an aimed activation is
+Physical MB1 remains the macro ON/OFF toggle. Once an RMB-held activation is
 accepted, the generated ownership-tagged MB1 is held continuously; Helldivers,
 not Python, controls the weapon's automatic cadence. No additional P binding is
 required.
@@ -138,7 +141,7 @@ requested weapon, mark it
 wait the complete weapon-specific reload time, then mark it `FULL` and arm it
 only if every operation and foreground check succeeded.
 
-Selection preparation is background work. An aimed, accepted MB1-down always wins: it
+Selection preparation is background work. An RMB-held, accepted MB1-down always wins: it
 cancels and invalidates unfinished switch-settle/reload preparation without
 joining or waiting for that worker, then schedules firing immediately. If
 preparation completed and was reconciled first, the magazine may be `FULL`;
@@ -159,23 +162,35 @@ and cannot leave the controller stuck in `PREPARING`.
 game-specific constant. Increase it if reload occurs before the selected weapon
 is ready. Selection never starts firing automatically.
 
-## Aim-required immediate MB1 down-edge toggle
+## Hold-to-aim and immediate MB1 down-edge toggle
+
+Set Helldivers Aim behavior to **Hold**. Hold physical RMB to aim, then press
+physical MB1 once to start the selected macro. Firing authority is based only
+on a current, valid physical foreground RMB hold; the application does not
+infer or alternate a game-side toggle state.
+
+The controller starts `RMB_RELEASED`. A fresh untagged, non-injected physical
+RMB-down observed while Helldivers is `ACTIVE_CERTAIN` establishes
+`RMB_HELD_VALID`; repeats do nothing. Physical RMB-up returns to
+`RMB_RELEASED`. Tagged/generated RMB, foreign injected RMB, and background or
+uncertain RMB cannot arm firing.
+
+Normal use is: hold RMB, press physical MB1 once, and keep RMB held. Release
+RMB, press either Shift, press MB1 again, or lose foreground to stop safely.
+After a hit or stagger removes aim, release and press RMB again if Helldivers
+does not resume hold aim automatically, then press MB1 to restart if desired.
+Hold mode removes toggle inversion, but the application still cannot prove the
+crosshair or the game's actual aim state; its permission represents only
+current valid physical RMB hold intent.
 
 An unmodified physical MB1 pair beginning while Helldivers is freshly confirmed
-foreground is suppressed. Its physical down edge can enable the selected macro
-only while the inferred aim state is exactly `AIM_ON`. `AIM_OFF` and `UNKNOWN`
-are rejected with `AIM_REQUIRED`: no worker, generated fire input, ON/OFF audio, or
-reload is created. MB1-up is cleanup-only: it clears physical/pair state and
-never starts, rejects, toggles, prepares, changes weapons, or emits audio. On
-an aimed accepted down edge the controller sets `enabled`, queues ON, invalidates
-and nonblockingly cancels any background preparation, publishes
-`RUNNING_PRIMARY` or `RUNNING_SECONDARY`, and activates generated firing in the
-same controller reconciliation. It does not wait for MB1-up, switch settle,
-reload input, reload completion, or preparation-thread exit.
-
-The controller continuously preserves `enabled or firing -> AIM_ON`. A known
-aim-off transition disables current firing; foreground loss makes aim
-`UNKNOWN`, cancels pending output, and also disables firing.
+foreground is suppressed. Its down edge can enable the selected macro only
+while RMB is validly held. Otherwise it is rejected with `RMB_HOLD_REQUIRED`:
+no worker, generated fire, reload, ammunition transition, or ON audio is
+created. MB1-up remains cleanup-only. On an accepted down edge the controller
+sets `enabled`, queues ON, invalidates and nonblockingly cancels background
+preparation, publishes `RUNNING_PRIMARY` or `RUNNING_SECONDARY`, and activates
+generated firing immediately.
 
 The configured policy is explicit:
 
@@ -185,7 +200,7 @@ start_policy = "immediate"
 ```
 
 Only `immediate` is supported. Deterministic fake-clock tests schedule the first
-generated MB1-down at 0 ms after an aimed accepted edge; the
+generated MB1-down at 0 ms after an RMB-held accepted edge; the
 application-controlled target is at most 50 ms from accepted physical MB1-down.
 Windows scheduling and the game are outside that measurement.
 
@@ -213,7 +228,7 @@ input is not owned, and cleanup is complete, the complete physical MB1 pair pass
 through normally and never toggles the macro.
 
 Ctrl+MB1 is the explicit normal-click bypass for menus and manual interaction.
-The aim-required firing gate applies only to unmodified MB1 macro activation;
+The RMB-hold-required firing gate applies only to unmodified MB1 macro activation;
 the bypass never enables a worker or plays ON/OFF audio.
 
 If a rapid Ctrl+MB1 begins while generated fire input is still down or cancellation
@@ -239,34 +254,21 @@ generation, and cannot enter preparation or restore
 distinct unmodified MB1-down is required. Ctrl alone is state-neutral while
 the macro is disabled. Ctrl+MB1 always marks the selected magazine `UNKNOWN`.
 
-Physical MB2 is the game's toggle-aim input. While the macro is not actively
-shooting, each physical pair passes through unchanged. Its first foreground
-down edge updates a conservative assumed state from `AIM_OFF` to `AIM_ON`, or
-from `AIM_ON` to `AIM_OFF`; repeat downs do not toggle repeatedly and MB2-up is
-edge cleanup only. After genuine foreground loss, one new untagged physical
-RMB-down explicitly resynchronizes `UNKNOWN -> AIM_ON`; the next RMB-down uses
-the normal `AIM_ON -> AIM_OFF` transition. Idle RMB never enables the macro, emits audio, generates
-Shift/R, or restarts firing. Tagged/generated and other injected MB2 events are
-ignored by the hook.
-
-During published active firing, the hook instead pair-latches and suppresses
-one physical RMB down/up pair, including repeats, and queues one controller
-transaction. The generated order is:
+Physical RMB passes through unchanged as the game's hold-to-aim input. RMB-down
+alone never starts or restarts firing; a new physical MB1 activation is always
+required. RMB-up during PRIMARY automatic hold or any SECONDARY firing phase
+removes authority immediately. The generated cleanup order is:
 
 ```text
 MACRO_DISABLED
-owned generated MB1-up, if automatic fire was held
+owned generated MB1-up, if fire was held
 FIRING_STOPPED / OFF once
-owned MB2-down
-owned MB2-up
-AIM_OFF
 ```
 
-This guarantees firing stops before Helldivers receives the captured aim-off
-toggle. The transaction never generates Shift or `R`, and a later physical RMB
-aim-on does not restart the macro; an aimed MB1 is required. If an ordinary
-reload had already begun, RMB passes normally, disables future firing, and
-allows that existing reload to finish without a duplicate `R`.
+RMB-up never generates MB2 or `R`. If reload already legitimately began, the
+existing reload may finish under the existing policy without a duplicate `R`.
+Pressing RMB again only establishes hold authority; physical MB1 is still
+required to restart.
 
 Physical Left and Right Shift are the game's toggle-sprint inputs. While the
 target is confirmed foreground, the hook pair-latches and suppresses one
@@ -275,15 +277,16 @@ transaction carrying the same Left/Right scan code. Outside Helldivers the pair
 passes through unchanged and creates no controller event. Tagged/generated
 Shift events are ignored by the hook and cannot recurse.
 
-The deferred transaction is ordered as follows:
+If Shift occurs while physical RMB is validly held, the deferred transaction is
+ordered as follows:
 
 ```text
 disable active firing and release owned generated MB1, if needed
-conditional owned MB2-down/up when assumed aim is ON
+one ownership-tokened, tagged MB2-up to neutralize the held aim
 owned replay of the same physical Shift scan-code down/up
 ```
 
-Aim-off therefore completes before Helldivers receives the sprint toggle. If
+The hold release therefore completes before Helldivers receives the sprint toggle. If
 active firing was stopped, OFF is queued exactly once and the selected magazine
 is marked conservatively. Shift never presses `R` and never creates a
 reload-only worker. While disabled and idle it changes no macro state,
@@ -296,34 +299,24 @@ result. Shift does not cancel it merely because sprinting permits reload, and
 does not press `R` again. The macro remains disabled afterward; MB1 must be
 pressed again to resume firing.
 
-The live controller starts with assumed `AIM_OFF`. With the default
-`controls.shift_cancels_aim_natively = false`, a deferred Shift sends one
-owned/tagged MB2 down/up pair only from `AIM_ON`. It first publishes
-`AIM_OFF_PENDING`, then `AIM_OFF` after successful MB2 delivery, and only then
-replays Shift. `AIM_OFF` and `UNKNOWN` never generate MB2, so Shift cannot
-blindly start aiming. A physical MB2 edge or foreground loss invalidates
-obsolete pending work; failures leave the inferred state conservative and are
-never retried blindly.
+Shift changes `RMB_HELD_VALID` to `RMB_HELD_REARM_REQUIRED`. While the original
+physical RMB pair remains down, repeats and later Shift presses cannot rearm it
+or emit duplicate hold-release output. The user must physically release RMB,
+then press it again in confirmed foreground. No generated RMB-down is ever
+fabricated.
 
-Sprint is a persistent game-side toggle. After the one replayed Shift pair,
-physical RMB continues to pass normally while firing is disabled. Toggling aim
-ON and then OFF does not generate another Shift or reload; Helldivers is
-responsible for resuming persistent sprint. If firing is started between those
-RMB edges, the RMB-off transaction above stops it before replaying aim-off, but
-still emits no Shift or reload. A second deliberate physical Shift creates
-exactly one second replay pair so the game can toggle sprint OFF.
-
-If Helldivers itself cancels toggle aim when Shift begins sprinting, set:
+Sprint remains a persistent game-side toggle. A second deliberate physical
+Shift creates exactly one second replay pair so the game can toggle sprint OFF.
+The only supported aim configuration is:
 
 ```toml
 [controls]
-shift_cancels_aim_natively = true
+aim_mode = "hold"
 ```
 
-In that mode Shift emits no generated MB2 and records the assumed state as
-`AIM_OFF` only after the replayed Shift pair succeeds, because native Shift is
-configured to cancel aim. If Shift ever causes aiming to turn on, enable this
-option.
+Unsupported values are rejected before hooks start. Toggle aim is not
+supported because hit, stagger, collision, animation, and other game-side
+cancellations cannot be observed reliably.
 
 For narrow Ctrl troubleshooting, set
 `diagnostics.ctrl_bypass_logging = true`. It logs only Ctrl cleanup state, MB1
@@ -350,16 +343,11 @@ options are disabled by default and never log unrelated user input.
 otherwise inert same-mode selection.
 
 Deferred sprint tracing is limited to low-volume transitions including
-`SHIFT_DEFERRED`, `SHIFT_TRANSACTION_STARTED`, `AIM_OFF_REQUESTED`,
-`AIM_OFF_SENT`, `AIM_OFF_SKIPPED`, `SHIFT_REPLAY_DOWN`, `SHIFT_REPLAY_UP`,
-`SHIFT_TRANSACTION_COMPLETED`, and `SHIFT_TRANSACTION_FAILED`.
-
-Aim gating and deferred firing-RMB tracing is likewise low-volume:
-`AIM_REQUIRED_REJECTED`, `AIM_OFF_DEFERRED`,
-`AIM_OFF_TRANSACTION_STARTED`, `AIM_OFF_FIRING_STOPPED`,
-`AIM_OFF_REPLAY_DOWN`, `AIM_OFF_REPLAY_UP`,
-`AIM_OFF_TRANSACTION_COMPLETED`, `AIM_OFF_TRANSACTION_FAILED`,
-`AIM_UNKNOWN_RESYNCED_ON`, and `AIM_UNKNOWN_NORMALIZED_OFF`.
+`SHIFT_DEFERRED`, `SHIFT_TRANSACTION_STARTED`,
+`RMB_HOLD_RELEASE_REQUESTED`, `RMB_HOLD_RELEASED_FOR_SHIFT`,
+`SHIFT_REPLAY_DOWN`, `SHIFT_REPLAY_UP`, `SHIFT_TRANSACTION_COMPLETED`, and
+`SHIFT_TRANSACTION_FAILED`. Hold gating uses `RMB_HOLD_ESTABLISHED`,
+`RMB_HOLD_RELEASED`, and `RMB_HOLD_REQUIRED_REJECTED`.
 
 Reload diagnostics use transition-local worker phases `FINAL_SHOT_DOWN`,
 `FINAL_SHOT_UP`, `RELOAD_KEY_DOWN`, `RELOAD_KEY_UP`,
@@ -369,16 +357,22 @@ milliseconds, and reason. For both weapon profiles, `FINAL_SHOT_UP` and
 `RELOAD_KEY_DOWN` must carry the same elapsed timestamp.
 
 Initial non-target or uncertain observations establish a startup baseline and
-leave the initial assumed aim state at `AIM_OFF`. The controller records when
+leave RMB authority released. The controller records when
 Helldivers is first observed `ACTIVE_CERTAIN`; only a later inactive/uncertain
 transition is a genuine foreground loss. Confirmed genuine foreground loss is
 one transaction: disable, invalidate the
-generation, cancel work, release owned input, retain the
+generation, cancel work, release owned input, invalidate any held RMB authority,
+retain the
 selected weapon, and mark affected ammunition `UNKNOWN`. Foreground regain
 alone never reloads, fires, plays audio, or replays clicks. A physical MB1-up
-must establish neutral input before a new toggle is accepted, and a selection
+must establish neutral MB1 input before a new MB1 toggle is accepted, and a selection
 key held across regain cannot create a fresh edge. The matching up of a pair
 suppressed before focus loss remains suppressed, preventing half-click leakage.
+
+If foreground is lost while RMB is physically held, regaining foreground does
+not rearm it. The user must release RMB, press RMB again in confirmed
+foreground, then press MB1. A stale held RMB is never promoted merely because
+the game regains focus.
 
 ## Conservative magazine state
 
@@ -491,7 +485,7 @@ acquisition from the hook. After Ctrl+C and safe shutdown, one summary reports:
   bounded injected-mouse and anomaly records.
 
 For a useful capture, manually establish 46 rounds, set the AR-2 to Automatic,
-aim, and start one complete PRIMARY cycle. The recorder freezes
+hold RMB, and start one complete PRIMARY cycle. The recorder freezes
 after its `R` pair, so Ctrl+C can be pressed later without contaminating the
 capture with subsequent cycles. Preserve the full `CADENCE DIAGNOSTICS SUMMARY` and report it
 along with the observed ammunition immediately before reload. An accepted
@@ -501,10 +495,10 @@ game-side boundary.
 
 ## Audio
 
-- ON: 1000 Hz for 100 ms, queued once on an aimed accepted immediate enable edge.
+- ON: 1000 Hz for 100 ms, queued once on an RMB-held accepted immediate enable edge.
 - OFF: 500 Hz for 150 ms, exactly once when an enabled macro is disabled. Shift
-  or deferred RMB-off queues OFF once when it stops active firing; idle input
-  and aim-required rejection are silent.
+  or physical RMB-up queues OFF once when it stops active firing; idle input
+  and hold-required rejection are silent.
 
 Preparation, selection, startup, and idle cancellation are silent. Audio uses a
 dedicated FIFO thread and cannot delay hook callbacks, input release, or timing.
@@ -528,20 +522,21 @@ python main.py --live
 python main.py --live --cadence-diagnostics
 ```
 
-Only `--live` installs hooks, suppresses paired physical MB1/foreground Shift
-or firing-RMB, or generates input. `--test-audio` plays only the configured
+Only `--live` installs hooks, suppresses paired physical MB1/foreground Shift,
+or generates input. Physical RMB continues to pass through as hold-to-aim.
+`--test-audio` plays only the configured
 tones. Dry runs, simulation,
 and foreground identification do not install hooks, send input, suppress input,
 access the game, wait in real time, or play sound. Simulation prints scenarios
-A through AZ and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
-the existing controller regressions plus aimed immediate UNKNOWN-ammunition start, switch-settle
+A through BA and ends with `DETERMINISTIC CONTROL SIMULATION: PASS` only after
+the existing controller regressions plus RMB-held immediate UNKNOWN-ammunition start, switch-settle
 preemption, active-reload preemption, immediate stop, and first-cycle reload
 synchronization all pass. Scenario V verifies zero-gap SECONDARY reload;
-scenarios W through AC preserve timing, reload, and toggle-aim regressions;
-scenarios AD through AJ verify firing/idle conditional aim-off ordering,
+scenarios W through AC preserve timing, reload, and hold-to-aim regressions;
+scenarios AD through AJ verify firing/idle hold-release ordering,
 persistent-sprint RMB isolation, a second sprint toggle, existing-reload
 preservation, zero Shift-created `R`, and foreground cleanup. Scenarios AK
-through AS verify both un-aimed rejections, FIFO aim-on/start, deferred RMB-off
+through AS verify both RMB-released rejections, FIFO RMB-hold/start, RMB-up stops
 for both weapons, persistent-sprint RMB/Shift paths, foreground cancellation,
 and preservation of an already-started reload without duplicate `R`. Scenario
 AT reproduces PowerShell-at-launch, first Helldivers acquisition, physical RMB,
@@ -550,6 +545,8 @@ Scenarios AU through AZ verify the exact F23/F24 sequences and durations,
 repeat/pair gating, background/uncertain/owned-event filtering, all busy-state
 rejections, active input exclusion, RMB/Shift/foreground/shutdown cleanup, and
 cancellation throughout every sequence timing phase and arrow position.
+Scenario BA models repeated hit/stagger recovery gestures and proves release/
+press cycles never invert firing eligibility.
 
 The complete non-live validation set is:
 
@@ -586,14 +583,10 @@ timestamp but the game still displays inactivity, that remaining gap is
 game-side animation/input acceptance rather than an application sleep. The
 application does not send blind reload retries.
 
-Aim state is inferred only from foreground physical MB2 edges and successful
-owned output. Game-side aim changes, missed events, focus changes, UI actions,
-or rejected input can desynchronize that assumption. Foreground loss and
-ambiguous pending-output races therefore set it to `UNKNOWN`; unmodified MB1 is
-then rejected until a physical foreground RMB-down explicitly resynchronizes
-aim ON. Shift never sends a blind MB2 toggle from `UNKNOWN`; after a successful
-owned Shift replay it conservatively normalizes the inferred state to
-`AIM_OFF`. The application cannot inspect the game's actual aim or
-persistent-sprint state. A captured RMB-off pair is replayed once with ordinary
-marked input; if the game rejects it, firing remains disabled and aim becomes
-`UNKNOWN` without a blind retry.
+The application cannot inspect the crosshair or the game's actual aim or
+persistent-sprint state. It tracks only valid physical RMB hold intent. Hold
+mode removes the alternating toggle assumption, so a game-side cancellation
+cannot invert an inferred on/off state. If Helldivers does not
+resume aim while RMB remains held after a hit, stagger, collision, or animation,
+release and press RMB again. There is no OCR, screen capture, game-memory read,
+polling, blind toggle retry, or automatic guess.

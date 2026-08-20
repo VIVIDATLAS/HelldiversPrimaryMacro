@@ -22,7 +22,7 @@ FOUR_TARGET_SEQUENCES: tuple[tuple[Direction, ...], ...] = (
     (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.RIGHT, Direction.UP),
     (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.LEFT),
     (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.UP, Direction.LEFT, Direction.UP),
-    (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.RIGHT),
+    (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.RIGHT, Direction.LEFT),
 )
 
 SUPPORT_SEQUENCES: tuple[tuple[Direction, ...], ...] = (

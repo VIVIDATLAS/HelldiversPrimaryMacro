@@ -12,7 +12,7 @@ reload_key = "R"
 poll_ms = 5
 toggle_debounce_ms = 30
 deferred_bypass_click_ms = 20
-shift_cancels_aim_natively = false
+aim_mode = "hold"
 
 [output]
 fire_device = "mouse"

@@ -175,6 +175,27 @@ class InputBackendTests(unittest.TestCase):
         )
         self.assertFalse(backend.aim_owned)
 
+    def test_hold_release_is_marked_up_only_token_idempotent_and_retryable(self) -> None:
+        user = FakeUser32()
+        backend = SendInputBackend(user32=user)
+        backend.release_held_aim(7)
+        backend.release_held_aim(7)
+        backend.release_held_aim(6)
+        self.assertEqual(
+            [item.mi.dwFlags for item in user.inputs], [MOUSEEVENTF_RIGHTUP]
+        )
+        self.assertEqual(user.inputs[0].mi.dwExtraInfo, INPUT_MARKER)
+
+        retry_user = FakeUser32([0, 1], last_error=5)
+        retry = SendInputBackend(user32=retry_user)
+        with self.assertRaises(InputApiError):
+            retry.release_held_aim(8)
+        retry.release_held_aim(8)
+        self.assertEqual(
+            [item.mi.dwFlags for item in retry_user.inputs],
+            [MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_RIGHTUP],
+        )
+
     def test_shift_replay_preserves_scan_code_and_is_marked_owned(self) -> None:
         user = FakeUser32()
         backend = SendInputBackend(user32=user)

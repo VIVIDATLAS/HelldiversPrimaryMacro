@@ -144,9 +144,9 @@ class StratagemTests(unittest.TestCase):
             FOUR_TARGET_SEQUENCES,
             (
                 (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.RIGHT, Direction.UP),
+                (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.LEFT),
                 (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.UP, Direction.LEFT, Direction.UP),
                 (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.RIGHT, Direction.LEFT),
-                (Direction.DOWN, Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT),
             ),
         )
         self.assertEqual(
@@ -156,7 +156,7 @@ class StratagemTests(unittest.TestCase):
                 (Direction.UP, Direction.DOWN, Direction.RIGHT, Direction.LEFT, Direction.UP),
             ),
         )
-        self.assertEqual(sequence_duration_ms(FOUR_TARGET_SEQUENCES, CONFIG.stratagems), 4200)
+        self.assertEqual(sequence_duration_ms(FOUR_TARGET_SEQUENCES, CONFIG.stratagems), 4160)
         self.assertEqual(sequence_duration_ms(SUPPORT_SEQUENCES, CONFIG.stratagems), 2040)
 
     def test_f23_f24_pair_latch_repeat_and_marker_filtering(self) -> None:
@@ -241,7 +241,7 @@ class StratagemTests(unittest.TestCase):
             CONFIG, backend, lambda: True, clock=clock, wait=wait, io_lock=Lock()
         ).run_stratagem(12, FOUR_TARGET_SEQUENCES, threading.Event(), threading.Event())
         self.assertTrue(result.success)
-        self.assertEqual(round((clock() - 100.0) * 1000), 4200)
+        self.assertEqual(round((clock() - 100.0) * 1000), 4160)
         names = [name for name, _token, _at in backend.events]
         self.assertEqual(names.count("CTRL_DOWN"), 4)
         self.assertEqual(names.count("MB1_DOWN"), 4)
@@ -307,7 +307,7 @@ class StratagemTests(unittest.TestCase):
 
     def test_dry_run_commands_have_exact_totals_without_live_components(self) -> None:
         for flag, total in (
-            ("--dry-run-stratagem-four", 4200),
+            ("--dry-run-stratagem-four", 4160),
             ("--dry-run-stratagem-support", 2040),
         ):
             with self.subTest(flag=flag):

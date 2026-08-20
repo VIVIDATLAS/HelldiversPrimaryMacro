@@ -378,7 +378,7 @@ class HookPolicyTests(unittest.TestCase):
             ],
         )
 
-    def test_firing_right_button_pair_is_deferred_suppressed_and_repeat_safe(self) -> None:
+    def test_firing_right_button_pair_passes_and_repeat_is_observation_only(self) -> None:
         coordination = InputCoordination()
         coordination.macro_started()
         coordination.firing_started()
@@ -389,10 +389,13 @@ class HookPolicyTests(unittest.TestCase):
             coordination=coordination,
         )
 
-        self.assertTrue(policy.mouse(WM_RBUTTONDOWN, 0, 0))
-        self.assertTrue(policy.mouse(WM_RBUTTONDOWN, 0, 0))
-        self.assertTrue(policy.mouse(WM_RBUTTONUP, 0, 0))
-        self.assertEqual(self.kinds(), [ControlEventKind.DEFERRED_AIM_OFF])
+        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
+        self.assertEqual(
+            self.kinds(),
+            [ControlEventKind.PHYSICAL_MB2_DOWN, ControlEventKind.PHYSICAL_MB2_UP],
+        )
 
     def test_right_button_passes_again_after_firing_snapshot_clears(self) -> None:
         coordination = InputCoordination()
@@ -416,7 +419,7 @@ class HookPolicyTests(unittest.TestCase):
             ],
         )
 
-    def test_tagged_right_button_is_ignored_without_disturbing_deferred_pair_latch(self) -> None:
+    def test_tagged_right_button_is_ignored_without_disturbing_physical_hold_latch(self) -> None:
         coordination = InputCoordination()
         coordination.macro_started()
         coordination.firing_started()
@@ -428,9 +431,20 @@ class HookPolicyTests(unittest.TestCase):
         )
         self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, INPUT_MARKER))
         self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, INPUT_MARKER))
-        self.assertTrue(policy.mouse(WM_RBUTTONDOWN, 0, 0))
-        self.assertTrue(policy.mouse(WM_RBUTTONUP, 0, 0))
-        self.assertEqual(self.kinds(), [ControlEventKind.DEFERRED_AIM_OFF])
+        self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+        self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
+        self.assertEqual(
+            self.kinds(),
+            [ControlEventKind.PHYSICAL_MB2_DOWN, ControlEventKind.PHYSICAL_MB2_UP],
+        )
+
+    def test_background_or_uncertain_right_down_never_routes_hold_authority(self) -> None:
+        for status in ((False, True), (False, False)):
+            with self.subTest(status=status):
+                policy = self.make_policy(status)
+                self.assertFalse(policy.mouse(WM_RBUTTONDOWN, 0, 0))
+                self.assertFalse(policy.mouse(WM_RBUTTONUP, 0, 0))
+                self.assertEqual(self.kinds(), [ControlEventKind.PHYSICAL_MB2_UP])
 
     def test_left_and_right_shift_autorepeat_emit_one_actionable_edge_each(self) -> None:
         policy = self.make_policy()

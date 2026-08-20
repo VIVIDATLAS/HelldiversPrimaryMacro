@@ -33,8 +33,7 @@ class GeneratedInput(Protocol):
     def fire_up(self) -> None: ...
     def mouse_down(self) -> None: ...
     def mouse_up(self) -> None: ...
-    def aim_down(self) -> None: ...
-    def aim_up(self) -> None: ...
+    def release_held_aim(self, token: int) -> None: ...
     def shift_down(self, scan_code: int) -> None: ...
     def shift_up(self) -> None: ...
     def reload_down(self) -> None: ...
@@ -481,13 +480,14 @@ class MacroEngine:
 
     def send_shift_transaction(
         self,
+        token: int,
         shift_scan_code: int,
-        cancel_aim: bool,
+        release_aim_hold: bool,
         cancel_event: threading.Event,
         shutdown_event: threading.Event,
         progress: Callable[[WorkerProgressUpdate], None] = lambda _progress: None,
-        aim_started: Callable[[], None] = lambda: None,
-        aim_sent: Callable[[], None] = lambda: None,
+        aim_release_started: Callable[[], None] = lambda: None,
+        aim_release_sent: Callable[[], None] = lambda: None,
         shift_started: Callable[[], None] = lambda: None,
         shift_sent: Callable[[], None] = lambda: None,
     ) -> WorkerResult:
@@ -499,21 +499,15 @@ class MacroEngine:
             progress(WorkerProgressUpdate(phase, self._clock(), reason))
 
         try:
-            if cancel_aim:
+            if release_aim_hold:
                 with self.io_lock:
                     self._check_active(cancel_event, shutdown_event)
-                    self.backend.aim_down()
-                    aim_started()
-                self._cancelable_wait(
-                    CONTROL_REPLAY_PRESS_MS, cancel_event, shutdown_event
-                )
-                with self.io_lock:
-                    self._check_active(cancel_event, shutdown_event)
-                    self.backend.aim_up()
-                    aim_sent()
+                    aim_release_started()
+                    self.backend.release_held_aim(token)
+                    aim_release_sent()
                 report(
-                    WorkerProgress.AIM_OFF_SENT,
-                    "owned tagged MB2 aim-off pair completed before Shift replay",
+                    WorkerProgress.AIM_HOLD_RELEASED,
+                    "one owned tagged MB2-up neutralized held aim before Shift replay",
                 )
 
             with self.io_lock:
@@ -534,56 +528,6 @@ class MacroEngine:
             report(
                 WorkerProgress.SHIFT_REPLAY_UP,
                 "owned tagged Shift replay released",
-            )
-            success = True
-        except InterruptedError:
-            canceled = True
-        except (ForegroundLost, InputApiError) as exc:
-            error = exc
-        except BaseException as exc:
-            error = exc
-        return self._finish_result(
-            success=success,
-            canceled=canceled,
-            error=error,
-            release_owned=self.backend.release_shift_inputs,
-        )
-
-    def send_aim_off_transaction(
-        self,
-        cancel_event: threading.Event,
-        shutdown_event: threading.Event,
-        progress: Callable[[WorkerProgressUpdate], None] = lambda _progress: None,
-        aim_started: Callable[[], None] = lambda: None,
-        aim_sent: Callable[[], None] = lambda: None,
-    ) -> WorkerResult:
-        """Replay one captured physical RMB pair after firing cleanup."""
-        error: BaseException | None = None
-        canceled = False
-        success = False
-
-        def report(phase: WorkerProgress, reason: str) -> None:
-            progress(WorkerProgressUpdate(phase, self._clock(), reason))
-
-        try:
-            with self.io_lock:
-                self._check_active(cancel_event, shutdown_event)
-                self.backend.aim_down()
-                aim_started()
-            report(
-                WorkerProgress.AIM_OFF_REPLAY_DOWN,
-                "owned tagged deferred RMB-off replay pressed",
-            )
-            self._cancelable_wait(
-                CONTROL_REPLAY_PRESS_MS, cancel_event, shutdown_event
-            )
-            with self.io_lock:
-                self._check_active(cancel_event, shutdown_event)
-                self.backend.aim_up()
-                aim_sent()
-            report(
-                WorkerProgress.AIM_OFF_REPLAY_UP,
-                "owned tagged deferred RMB-off replay released",
             )
             success = True
         except InterruptedError:
@@ -743,8 +687,8 @@ class MacroWorker:
         self._finish_after_reload = threading.Event()
         self._reload_started = threading.Event()
         self._reload_completed = threading.Event()
-        self._aim_started = threading.Event()
-        self._aim_sent = threading.Event()
+        self._aim_release_started = threading.Event()
+        self._aim_release_sent = threading.Event()
         self._shift_started = threading.Event()
         self._shift_sent = threading.Event()
         self._activation = threading.Event()
@@ -775,8 +719,6 @@ class MacroWorker:
                 ):
                     self._engine.backend.reload_up()
                 elif self.request.kind is WorkerKind.SHIFT_TRANSACTION:
-                    self._engine.backend.release_shift_inputs()
-                elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
                     self._engine.backend.release_shift_inputs()
                 elif self.request.kind is WorkerKind.STRATAGEM:
                     self._engine.backend.release_stratagem(self.token)
@@ -822,16 +764,16 @@ class MacroWorker:
         """Cancel a deferred Shift transaction and release only its inputs."""
         self.cancel()
         status = (
-            self._aim_started.is_set(),
-            self._aim_sent.is_set(),
+            self._aim_release_started.is_set(),
+            self._aim_release_sent.is_set(),
             self._shift_started.is_set(),
             self._shift_sent.is_set(),
         )
         try:
             with self._engine.io_lock:
                 status = (
-                    self._aim_started.is_set(),
-                    self._aim_sent.is_set(),
+                    self._aim_release_started.is_set(),
+                    self._aim_release_sent.is_set(),
                     self._shift_started.is_set(),
                     self._shift_sent.is_set(),
                 )
@@ -897,23 +839,16 @@ class MacroWorker:
             )
         elif self.request.kind is WorkerKind.SHIFT_TRANSACTION:
             result = self._engine.send_shift_transaction(
+                self.token,
                 self.request.shift_scan_code,
-                self.request.cancel_aim,
+                self.request.release_aim_hold,
                 self.cancel_event,
                 self._shutdown,
                 lambda update: self._on_progress(self.token, update),
-                self._aim_started.set,
-                self._aim_sent.set,
+                self._aim_release_started.set,
+                self._aim_release_sent.set,
                 self._shift_started.set,
                 self._shift_sent.set,
-            )
-        elif self.request.kind is WorkerKind.AIM_OFF_TRANSACTION:
-            result = self._engine.send_aim_off_transaction(
-                self.cancel_event,
-                self._shutdown,
-                lambda update: self._on_progress(self.token, update),
-                self._aim_started.set,
-                self._aim_sent.set,
             )
         elif self.request.kind is WorkerKind.BYPASS:
             result = self._engine.forward_bypass(

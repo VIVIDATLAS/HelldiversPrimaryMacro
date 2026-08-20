@@ -15,11 +15,10 @@ class MagazineState(Enum):
     UNKNOWN = "UNKNOWN"
 
 
-class AimState(Enum):
-    AIM_OFF = auto()
-    AIM_ON = auto()
-    AIM_OFF_PENDING = auto()
-    UNKNOWN = auto()
+class RmbHoldState(Enum):
+    RELEASED = auto()
+    HELD_VALID = auto()
+    HELD_REARM_REQUIRED = auto()
 
 
 class PreparationLifecycle(Enum):
@@ -36,17 +35,11 @@ class Mb1PairDecision(Enum):
     DEFERRED_BYPASS = auto()
 
 
-class Mb2PairDecision(Enum):
-    PASS_THROUGH = auto()
-    DEFERRED_AIM_OFF = auto()
-
-
 class WorkerKind(Enum):
     MACRO = auto()
     PREPARATION = auto()
     RELOAD_ONLY = auto()
     SHIFT_TRANSACTION = auto()
-    AIM_OFF_TRANSACTION = auto()
     BYPASS = auto()
     STRATAGEM = auto()
 
@@ -60,9 +53,7 @@ class WorkerProgress(Enum):
     RELOAD_WAIT_STARTED = auto()
     RELOAD_COMPLETED = auto()
     RELOAD_FAILED = auto()
-    AIM_OFF_SENT = auto()
-    AIM_OFF_REPLAY_DOWN = auto()
-    AIM_OFF_REPLAY_UP = auto()
+    AIM_HOLD_RELEASED = auto()
     SHIFT_REPLAY_DOWN = auto()
     SHIFT_REPLAY_UP = auto()
     # Compatibility alias for existing callers while trace output uses the
@@ -97,7 +88,6 @@ class ControlEventKind(Enum):
     PHYSICAL_MB1_UP = auto()
     PHYSICAL_MB2_DOWN = auto()
     PHYSICAL_MB2_UP = auto()
-    DEFERRED_AIM_OFF = auto()
     MANUAL_BYPASS_DOWN = auto()
     DEFERRED_BYPASS_DOWN = auto()
     DEFERRED_BYPASS_UP = auto()
@@ -153,9 +143,7 @@ class WorkerRequest:
     generation: int = 0
     shift_vk_code: int = 0
     shift_scan_code: int = 0
-    cancel_aim: bool = False
-    native_aim_cancel: bool = False
-    normalize_unknown_aim: bool = False
+    release_aim_hold: bool = False
     stratagem_sequences: tuple[tuple[Any, ...], ...] = ()
 
 

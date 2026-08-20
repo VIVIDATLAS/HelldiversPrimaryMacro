@@ -51,7 +51,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.secondary.reload_press_ms, 25)
         self.assertEqual(config.secondary.reload_wait_ms, 2000)
         self.assertEqual(config.controls.deferred_bypass_click_ms, 20)
-        self.assertFalse(config.controls.shift_cancels_aim_natively)
+        self.assertEqual(config.controls.aim_mode, "hold")
         self.assertEqual(config.output.fire_device, "mouse")
         self.assertIsNone(config.output.fire_scan_code)
         self.assertTrue(config.weapons.reload_on_select)
@@ -191,11 +191,11 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "must be positive"):
             parse_config(raw)
 
-    def test_shift_cancels_aim_natively_must_be_boolean(self) -> None:
+    def test_aim_mode_supports_only_hold(self) -> None:
         raw = raw_config()
-        raw["controls"]["shift_cancels_aim_natively"] = "false"
+        raw["controls"]["aim_mode"] = "toggle"
         with self.assertRaisesRegex(
-            ConfigError, "controls.shift_cancels_aim_natively must be a boolean"
+            ConfigError, "controls.aim_mode supports only 'hold'"
         ):
             parse_config(raw)
 

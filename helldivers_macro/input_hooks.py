@@ -12,7 +12,6 @@ from .models import (
     ControlEventKind,
     EventSource,
     Mb1PairDecision,
-    Mb2PairDecision,
     ShiftStroke,
 )
 from .windows_abi import (
@@ -123,7 +122,7 @@ class HookPolicy:
         self._keys_down: set[int] = set()
         self._left_pair_decision: Mb1PairDecision | None = None
         self._left_pair_is_manual = False
-        self._right_pair_decision: Mb2PairDecision | None = None
+        self._right_physical_down = False
         self._deferred_shift_pairs: set[int] = set()
         self._stratagem_pairs: dict[int, bool] = {}
 
@@ -230,7 +229,7 @@ class HookPolicy:
                 if active:
                     # The pair latch suppresses this edge, autorepeat, and the
                     # matching up. The controller later replays one owned pair
-                    # after firing cleanup and conditional aim cancellation.
+                    # after firing cleanup and any required hold-aim release.
                     self._deferred_shift_pairs.add(vk_code)
                     self._emit(
                         ControlEventKind.SHIFT_DOWN,
@@ -300,26 +299,19 @@ class HookPolicy:
             return False
 
         if message == WM_RBUTTONDOWN:
-            if self._right_pair_decision is not None:
-                return (
-                    self._right_pair_decision
-                    is Mb2PairDecision.DEFERRED_AIM_OFF
+            if self._right_physical_down:
+                return False
+            self._right_physical_down = True
+            active, certain = self._foreground_status()
+            if active and certain:
+                self._emit(
+                    ControlEventKind.PHYSICAL_MB2_DOWN,
+                    detail=self._coordination.stratagem_active(),
                 )
-            active, _certain = self._foreground_status()
-            if active and self._coordination.firing_active():
-                self._right_pair_decision = Mb2PairDecision.DEFERRED_AIM_OFF
-                self._emit(ControlEventKind.DEFERRED_AIM_OFF)
-                return True
-            self._right_pair_decision = Mb2PairDecision.PASS_THROUGH
-            if active:
-                self._emit(ControlEventKind.PHYSICAL_MB2_DOWN)
             return False
         if message == WM_RBUTTONUP:
-            decision = self._right_pair_decision
-            self._right_pair_decision = None
-            if decision is Mb2PairDecision.DEFERRED_AIM_OFF:
-                return True
-            if decision is Mb2PairDecision.PASS_THROUGH:
+            if self._right_physical_down:
+                self._right_physical_down = False
                 self._emit(ControlEventKind.PHYSICAL_MB2_UP)
             return False
 

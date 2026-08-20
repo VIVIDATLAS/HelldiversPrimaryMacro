@@ -27,7 +27,7 @@ class ControlsConfig:
     poll_ms: int
     toggle_debounce_ms: int
     deferred_bypass_click_ms: int
-    shift_cancels_aim_natively: bool
+    aim_mode: str
 
 
 @dataclass(frozen=True)
@@ -226,9 +226,7 @@ def parse_config(data: Mapping[str, Any]) -> AppConfig:
         deferred_bypass_click_ms=_value(
             controls_t, "controls", "deferred_bypass_click_ms", int
         ),
-        shift_cancels_aim_natively=_value(
-            controls_t, "controls", "shift_cancels_aim_natively", bool
-        ),
+        aim_mode=_value(controls_t, "controls", "aim_mode", str).casefold(),
     )
     fire_device = _value(output_t, "output", "fire_device", str)
     fire_scan_code = output_t.get("fire_scan_code")
@@ -330,6 +328,8 @@ def validate_config(config: AppConfig) -> None:
     _nonnegative("controls.toggle_debounce_ms", config.controls.toggle_debounce_ms)
     if config.controls.deferred_bypass_click_ms <= 0:
         raise ConfigError("controls.deferred_bypass_click_ms must be positive")
+    if config.controls.aim_mode != "hold":
+        raise ConfigError("controls.aim_mode supports only 'hold'")
     if config.output.fire_device not in {"keyboard", "mouse"}:
         raise ConfigError(
             "output.fire_device must be exactly 'keyboard' or 'mouse'"

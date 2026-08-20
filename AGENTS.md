@@ -5,11 +5,11 @@ APIs are called only through `ctypes`. `main.py` is the CLI; configuration lives
 in `config.toml`. `input_hooks.py` owns the low-level hook/message-loop thread,
 `foreground.py` owns read-only foreground checks, `state_machine.py` owns all
 generation-gated control transitions, `macro_engine.py` owns the active macro
-worker, deferred Shift/RMB transactions, and short-lived canceled preparation cleanup, and
+worker, deferred Shift transactions, and short-lived canceled preparation cleanup, and
 `input_backend.py` owns marked `SendInput` events, generated-input cleanup, and
 the nonblocking hook/controller cleanup gate. `state_machine.py` tracks separate
 `UNKNOWN`/`FULL` magazine states and owns macro, reload-preparation,
-deferred-bypass, deferred RMB-off, and Shift transitions. Audio notifications
+deferred-bypass, physical RMB-hold validity, and Shift transitions. Audio notifications
 have their own queue/thread.
 `simulation.py` provides deterministic end-to-end sessions using only fake OS
 boundaries, input, clock/waiting, workers, and audio.
@@ -50,33 +50,31 @@ SECONDARY is tap mode: 13 shots at a 120 ms period with generated MB1 down for
 35 ms and an 85 ms release interval only between consecutive shots. Its final
 MB1-up and R-down
 are consecutive with no post-shot wait; its configured complete cycle is
-3,500 ms. Macro activation requires confirmed foreground ownership and known
-`AIM_ON`; unmodified MB1 is suppressed but rejected without output or audio
-from `AIM_OFF`/`UNKNOWN`. Idle physical MB2 passes through while the controller
-tracks only an assumed toggle-aim state. During published firing, physical MB2
-is pair-latched and deferred so firing cleanup and owned fire-up complete before
-one tagged MB2 pair turns aim off. That transaction never emits Shift or R.
-The controller invariant is `enabled or firing -> AIM_ON`; any observed or
-committed departure from `AIM_ON` disables current firing.
-Initial non-target foreground observations preserve `AIM_OFF` until the target
-has first been observed `ACTIVE_CERTAIN`. After genuine foreground loss, one
-new physical foreground MB2-down explicitly resynchronizes `UNKNOWN` to
-`AIM_ON`; tagged/generated MB2 cannot do so. Successful Shift replay from
-`UNKNOWN` generates no MB2 and conservatively normalizes aim to `AIM_OFF`.
-Foreground physical Shift pairs are pair-latched,
-suppressed, and replayed once with the same Left/Right scan code. Active firing
-is disabled and owned generated MB1 is released before conditional aim-off; a tagged MB2
-pair is generated only from `AIM_ON`, and its up precedes replayed Shift-down.
-`AIM_OFF` and `UNKNOWN` never generate MB2. Shift never initiates reload work.
-An already-active reload may finish while sprinting. When
-`controls.shift_cancels_aim_natively` is true, Shift generates no MB2 and
-records assumed aim OFF only after successful Shift replay. Persistent sprint
-remains game-owned; later physical MB2 pairs never generate Shift.
+3,500 ms. Helldivers Aim must be set to Hold; `controls.aim_mode` accepts only
+`"hold"`. Macro activation requires confirmed foreground ownership and current
+`RMB_HELD_VALID`; unmodified MB1 is suppressed but rejected without output or
+audio from `RMB_RELEASED` or `RMB_HELD_REARM_REQUIRED`. Genuine physical RMB
+passes through. A fresh foreground physical down arms hold authority, repeats
+do nothing, and physical up releases authority and immediately stops active
+firing without R or automatic restart. Tagged/generated, foreign injected,
+background, and uncertain RMB cannot arm firing.
+
+Foreground loss invalidates a held RMB. Regain never promotes a stale hold;
+physical RMB-up followed by a fresh foreground down is required. Foreground
+physical Shift pairs are pair-latched, suppressed, and replayed once with the
+same Left/Right scan code. Active firing is disabled and owned generated MB1 is
+released first. If RMB was validly held, one token-owned marked MB2-up (never a
+down/up toggle pair) neutralizes hold aim before Shift replay and changes hold
+state to `RMB_HELD_REARM_REQUIRED`. Shift repeat/up do not duplicate output,
+Shift never initiates reload work, and an already-active reload may finish.
+Persistent sprint remains game-owned; later physical RMB cycles never generate
+Shift. The application cannot observe the crosshair or game-side cancellation;
+after a hit/stagger, release and press RMB again if aim does not resume.
 
 Never read or depend on Lua, Logitech G HUB, AutoHotkey, drivers, game memory,
 injection, interception, hardware emulation, anti-cheat workarounds, network
 traffic, third-party packages, or administrator access. Only `--live` may
-install hooks, suppress paired physical MB1/foreground Shift/firing-RMB events, or call
+install hooks, suppress paired physical MB1/foreground Shift events, or call
 `SendInput`.
 
 Authorized validation commands:
@@ -105,12 +103,12 @@ preparation ends armed/FULL or idle/UNKNOWN unless immediate MB1 invalidates it;
 immediate fire never waits for preparation; ON/OFF transitions are deduplicated; audio test shutdown drains
 accepted tones and exposes worker failures; all owned fire/MB1-bypass/MB2/Shift/R downs are released
 on every exit; physical MB1-down is the only toggle edge and physical MB1-up is cleanup-only;
-same-mode selection cannot mutate macro state; idle MB2 only updates inferred
-aim, while firing MB2 disables before aim-off replay and never emits Shift/R;
+same-mode selection cannot mutate macro state; physical RMB hold validity never
+alternates, RMB-up disables firing without replay or R, and RMB cannot restart;
 Ctrl cannot restart canceled work; foreground regain requires neutral physical
 input and never auto-restarts; foreground physical Shift is deferred once per pair, disables
-active firing once, conditionally exits aim before same-scan Shift replay,
+active firing once, conditionally sends one tagged RMB-up before same-scan Shift replay,
 preserves an existing reload, never initiates `R`, and never restarts firing;
-scenarios A-AZ and all authorized validation commands pass.
+scenarios A-BA and all authorized validation commands pass.
 Ctrl-bypass and state-trace diagnostics default off and never log unrelated
 input; trace reasons are transition-local and include elapsed milliseconds.

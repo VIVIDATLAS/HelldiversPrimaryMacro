@@ -38,6 +38,7 @@ class RecordingBackend:
         self.timed_events: list[tuple[str, int]] = []
         self.mouse_owned = False
         self.aim_owned = False
+        self.last_aim_hold_release_token = 0
         self.shift_owned = False
         self.shift_scan = 0
         self.reload_owned = False
@@ -76,6 +77,12 @@ class RecordingBackend:
             return
         self._event("MB2_UP")
         self.aim_owned = False
+
+    def release_held_aim(self, token: int) -> None:
+        if token <= self.last_aim_hold_release_token:
+            return
+        self._event("MB2_UP")
+        self.last_aim_hold_release_token = token
 
     def shift_down(self, scan_code: int) -> None:
         self.shift_owned = True
@@ -581,7 +588,7 @@ class MacroSequenceTests(unittest.TestCase):
                 self.assertFalse(backend.mouse_owned)
                 self.assertFalse(backend.reload_owned)
 
-    def test_shift_transaction_orders_aim_off_before_same_scan_replay(self) -> None:
+    def test_shift_transaction_releases_hold_aim_before_same_scan_replay(self) -> None:
         fake_time = FakeTime()
         backend = RecordingBackend(clock=fake_time.clock)
         progress = []
@@ -592,6 +599,7 @@ class MacroSequenceTests(unittest.TestCase):
             clock=fake_time.clock,
             wait=fake_time.wait,
         ).send_shift_transaction(
+            7,
             0x36,
             True,
             threading.Event(),
@@ -602,17 +610,16 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertEqual(
             backend.timed_events,
             [
-                ("MB2_DOWN", 0),
-                ("MB2_UP", 20),
-                ("SHIFT_DOWN", 20),
-                ("SHIFT_UP", 40),
+                ("MB2_UP", 0),
+                ("SHIFT_DOWN", 0),
+                ("SHIFT_UP", 20),
             ],
         )
         self.assertEqual(backend.shift_scan, 0)
         self.assertEqual(
             [update.phase for update in progress],
             [
-                WorkerProgress.AIM_OFF_SENT,
+                WorkerProgress.AIM_HOLD_RELEASED,
                 WorkerProgress.SHIFT_REPLAY_DOWN,
                 WorkerProgress.SHIFT_REPLAY_UP,
             ],
@@ -620,7 +627,7 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertFalse(backend.aim_owned)
         self.assertFalse(backend.shift_owned)
 
-    def test_shift_transaction_skips_mb2_when_aim_is_not_known_on(self) -> None:
+    def test_shift_transaction_skips_mb2_when_rmb_is_released(self) -> None:
         fake_time = FakeTime()
         backend = RecordingBackend(clock=fake_time.clock)
         result = MacroEngine(
@@ -630,6 +637,7 @@ class MacroSequenceTests(unittest.TestCase):
             clock=fake_time.clock,
             wait=fake_time.wait,
         ).send_shift_transaction(
+            7,
             0x2A,
             False,
             threading.Event(),
@@ -658,6 +666,7 @@ class MacroSequenceTests(unittest.TestCase):
             wait=wait,
             io_lock=lock,
         ).send_shift_transaction(
+            7,
             0x2A,
             True,
             threading.Event(),
@@ -666,42 +675,12 @@ class MacroSequenceTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertFalse(lock.held)
 
-    def test_deferred_aim_off_replays_one_owned_pair_without_shift_or_reload(self) -> None:
-        fake_time = FakeTime()
-        backend = RecordingBackend(clock=fake_time.clock)
-        lock = TrackingLock()
-        progress = []
-
-        def wait(event: threading.Event, seconds: float) -> bool:
-            self.assertFalse(lock.held)
-            return fake_time.wait(event, seconds)
-
-        result = MacroEngine(
-            CONFIG,
-            backend,
-            lambda: True,
-            clock=fake_time.clock,
-            wait=wait,
-            io_lock=lock,
-        ).send_aim_off_transaction(
-            threading.Event(),
-            threading.Event(),
-            progress.append,
-        )
-        self.assertTrue(result.success)
-        self.assertEqual(
-            backend.timed_events,
-            [("MB2_DOWN", 0), ("MB2_UP", 20)],
-        )
-        self.assertEqual(
-            [update.phase for update in progress],
-            [
-                WorkerProgress.AIM_OFF_REPLAY_DOWN,
-                WorkerProgress.AIM_OFF_REPLAY_UP,
-            ],
-        )
-        self.assertFalse(backend.aim_owned)
-        self.assertFalse(lock.held)
+    def test_hold_release_is_up_only_and_idempotent_per_worker_token(self) -> None:
+        backend = RecordingBackend()
+        backend.release_held_aim(7)
+        backend.release_held_aim(7)
+        backend.release_held_aim(6)
+        self.assertEqual(backend.events, ["MB2_UP"])
 
     def test_macro_waits_never_hold_output_lock(self) -> None:
         backend = RecordingBackend()

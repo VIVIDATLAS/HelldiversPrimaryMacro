@@ -181,6 +181,7 @@ class SendInputBackend:
         self._mouse_owned = False
         self._fire_key_owned = False
         self._aim_owned = False
+        self._last_aim_hold_release_token = 0
         self._shift_owned = False
         self._shift_scan = 0
         self._reload_owned = False
@@ -431,6 +432,16 @@ class SendInputBackend:
                 self._mouse_input(MOUSEEVENTF_RIGHTUP), "MB2 up"
             )
             self._aim_owned = False
+
+    def release_held_aim(self, token: int) -> None:
+        """Send one marked RMB-up for a Shift transaction token."""
+        with self._lock:
+            if token <= self._last_aim_hold_release_token:
+                return
+            self._send_exactly_one(
+                self._mouse_input(MOUSEEVENTF_RIGHTUP), "held physical MB2 up"
+            )
+            self._last_aim_hold_release_token = token
 
     def shift_down(self, scan_code: int) -> None:
         with self._lock:
